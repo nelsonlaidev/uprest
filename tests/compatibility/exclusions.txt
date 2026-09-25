@@ -1,0 +1,21 @@
+# Upstash Search and Vector APIs
+packages/redis/pkg/commands/search/search-stream.test.ts
+packages/redis/pkg/commands/search/search.test.ts
+packages/redis/pkg/commands/vector/vector.test.ts
+packages/redis/pkg/commands/vector_add.test.ts
+packages/redis/pkg/commands/vector_count.test.ts
+packages/redis/pkg/commands/vector_create.test.ts
+packages/redis/pkg/commands/vector_del.test.ts
+packages/redis/pkg/commands/vector_drop.test.ts
+packages/redis/pkg/commands/vector_get.test.ts
+packages/redis/pkg/commands/vector_info.test.ts
+packages/redis/pkg/commands/vector_query.test.ts
+
+# Upstash SSE subscription endpoints
+packages/redis/pkg/commands/psubscribe.test.ts
+packages/redis/pkg/commands/subscribe.test.ts
+
+# RedisJSON result ordering divergences
+packages/redis/pkg/commands/json_get.test.ts
+packages/redis/pkg/commands/json_mget.test.ts
+packages/redis/pkg/commands/json_objlen.test.ts

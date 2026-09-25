@@ -1,0 +1,55 @@
+version: 2
+
+project_name: uprest
+
+builds:
+  - id: uprest
+    main: ./cmd/uprest
+    binary: uprest
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - ids:
+      - uprest
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  prerelease: auto
+
+dockers_v2:
+  - id: uprest
+    ids:
+      - uprest
+    dockerfile: Dockerfile.release
+    images:
+      - ghcr.io/nelsonlaidev/uprest
+      - nelsonlaidev/uprest
+    tags:
+      - '{{ .Tag }}'
+      - '{{ if and (not .IsSnapshot) (not .IsNightly) (eq .Prerelease "") }}latest{{ end }}'
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.source: https://github.com/nelsonlaidev/uprest
+      org.opencontainers.image.licenses: MIT

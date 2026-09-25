@@ -1,0 +1,10 @@
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/uprest /uprest
+
+WORKDIR /app/uprest-config
+WORKDIR /app
+ENV UPREST_PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/uprest"]

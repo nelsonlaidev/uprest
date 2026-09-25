@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsx smoke.ts"
+  },
+  "dependencies": {
+    "@upstash/ratelimit": "2.2.0",
+    "@upstash/redis": "1.39.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

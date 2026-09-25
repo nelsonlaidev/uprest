@@ -1,0 +1,193 @@
+name: Upstream SDK compatibility
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/compatibility.yml'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'tests/compatibility/**'
+      - 'Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+
+  pull_request:
+
+  schedule:
+    - cron: '0 8 * * *'
+
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: upstash/redis-js branch, tag, or commit
+        required: false
+        default: 6b2772753067e7d1aa103de25a3ee37bfd98093a
+        type: string
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: compatibility-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream:
+    name: '@upstash/redis upstream suite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref || (github.event_name == 'schedule' && 'main') || '6b2772753067e7d1aa103de25a3ee37bfd98093a' }}
+      UPSTASH_REDIS_REST_URL: http://localhost:8079
+      UPSTASH_REDIS_REST_TOKEN: compatibility-token
+
+    services:
+      redis:
+        image: redis:8.10.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+
+    steps:
+      - name: Checkout uprest
+        uses: actions/checkout@v7
+
+      - name: Build uprest image
+        run: docker build --tag uprest:compatibility .
+
+      - name: Start uprest
+        run: |
+          docker run --detach \
+            --name uprest-compatibility \
+            --network host \
+            --env UPREST_PORT=8079 \
+            --env UPREST_TOKEN="$UPSTASH_REDIS_REST_TOKEN" \
+            --env UPREST_CONNECTION_STRING=redis://localhost:6379 \
+            uprest:compatibility
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --request POST "$UPSTASH_REDIS_REST_URL" \
+              --header "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '["PING"]' | grep -q '"result":"PONG"'; then
+              exit 0
+            fi
+
+            sleep 1
+          done
+
+          docker logs uprest-compatibility
+          exit 1
+
+      - name: Checkout upstream redis-js
+        uses: actions/checkout@v7
+        with:
+          repository: upstash/redis-js
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream/redis-js
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: upstream/redis-js/pnpm-lock.yaml
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Run compatibility suite
+        id: compatibility
+        run: tests/compatibility/run.sh upstream/redis-js "$GITHUB_WORKSPACE/compatibility-results.xml"
+
+      - name: Collect compatibility artifacts
+        id: metadata
+        if: always()
+        env:
+          COMPATIBILITY_OUTCOME: ${{ steps.compatibility.outcome || 'not-run' }}
+        run: |
+          report_dir="$RUNNER_TEMP/uprest-compatibility-report"
+          mkdir -p "$report_dir"
+
+          upstream_sha=unavailable
+          if resolved_sha=$(git -C upstream/redis-js rev-parse HEAD 2>/dev/null); then
+            upstream_sha="$resolved_sha"
+          fi
+
+          exclusions=$(grep -Ec '^[^#[:space:]]' tests/compatibility/exclusions.txt)
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "exclusions=$exclusions" >> "$GITHUB_OUTPUT"
+
+          cat > "$report_dir/metadata.md" <<EOF
+          # @upstash/redis compatibility
+
+          | Field | Value |
+          | --- | --- |
+          | Result | $COMPATIBILITY_OUTCOME |
+          | Requested upstream ref | $UPSTREAM_REF |
+          | Resolved upstream commit | $upstream_sha |
+          | Redis image | redis:8.10.2 |
+          | Excluded upstream files | $exclusions |
+          EOF
+
+          cp tests/compatibility/exclusions.txt tests/compatibility/upstream.patch "$report_dir/"
+
+          if [[ -f compatibility-results.xml ]]; then
+            cp compatibility-results.xml "$report_dir/"
+          fi
+
+          docker logs uprest-compatibility > "$report_dir/uprest.log" 2>&1 || true
+
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uprest-compatibility-${{ github.run_id }}
+          path: ${{ runner.temp }}/uprest-compatibility-report
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish compatibility test report
+        if: always() && steps.compatibility.outcome != 'skipped'
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: compatibility-results.xml
+          check_name: '@upstash/redis compatibility'
+          comment: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
+          updateComment: true
+          annotate_only: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') }}
+          detailed_summary: true
+          include_passed: false
+          include_skipped: false
+          skip_annotations: true
+          fail_on_parse_error: true
+          skip_comment_without_tests: true
+          summary: |
+            Requested upstream ref: `${{ env.UPSTREAM_REF }}`
+            Resolved upstream commit: `${{ steps.metadata.outputs.upstream_sha }}`
+            Redis image: `redis:8.10.2`
+            Excluded upstream files: `${{ steps.metadata.outputs.exclusions }}`
+
+            [Compatibility artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)
+
+            The checked-in exclusion list and targeted upstream patch define the documented intentional divergences.
+
+      - name: Stop uprest
+        if: always()
+        run: docker rm --force uprest-compatibility
