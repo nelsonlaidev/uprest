@@ -56,18 +56,21 @@ func run() error {
 	}
 
 	address := net.JoinHostPort(host, strconv.Itoa(cfg.Port))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	defer stop()
+
 	httpServer := &http.Server{
-		Addr:              address,
-		Handler:           server.NewHandler(pools, logger),
+		Addr:    address,
+		Handler: server.NewHandler(pools, logger),
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      50 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-
-	defer stop()
 
 	logger.Info("listening",
 		"address", address,

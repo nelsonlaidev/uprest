@@ -11,10 +11,6 @@ packages/redis/pkg/commands/vector_get.test.ts
 packages/redis/pkg/commands/vector_info.test.ts
 packages/redis/pkg/commands/vector_query.test.ts
 
-# Upstash SSE subscription endpoints
-packages/redis/pkg/commands/psubscribe.test.ts
-packages/redis/pkg/commands/subscribe.test.ts
-
 # RedisJSON result ordering divergences
 packages/redis/pkg/commands/json_get.test.ts
 packages/redis/pkg/commands/json_mget.test.ts

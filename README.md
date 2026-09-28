@@ -2,7 +2,7 @@
 
 uprest is a local HTTP-to-Redis proxy for applications that use the Upstash Redis REST API. It forwards requests to a real Redis server, so your application can use `@upstash/redis` during local development and CI.
 
-It supports commands, pipelines, transactions, JSON or RESP2 responses, and bearer-token or `_token` query authentication. It also adapts the Upstash-specific Lua flag used by recent `@upstash/ratelimit` versions so those scripts run on Redis.
+It supports commands, pipelines, transactions, Redis Pub/Sub over Server-Sent Events, JSON or RESP2 responses, and bearer-token or `_token` query authentication. It also adapts the Upstash-specific Lua flag used by recent `@upstash/ratelimit` versions so those scripts run on Redis.
 
 ## Quick start
 
@@ -66,6 +66,29 @@ curl -X POST http://localhost:8079/ \
 The response is `{"result":"OK"}`.
 
 Set `Upstash-Response-Format: resp2` to receive the raw Redis reply with an `application/octet-stream` content type. RESP2 is available for individual commands and pipelines; transactions at `/multi-exec` always return JSON.
+
+### Pub/Sub streaming
+
+`@upstash/redis` subscriptions work through authenticated `POST /subscribe/<channel...>` and `POST /psubscribe/<pattern...>` Server-Sent Event streams:
+
+```ts
+const subscriber = redis.subscribe<{ text: string }>('updates')
+
+subscriber.on('message', ({ channel, message }) => {
+  console.log(channel, message.text)
+})
+
+await new Promise<void>((resolve, reject) => {
+  subscriber.on('subscribe', () => resolve())
+  subscriber.on('error', reject)
+})
+
+await redis.publish('updates', { text: 'hello' })
+
+await subscriber.unsubscribe()
+```
+
+uprest sends an SSE comment heartbeat every 15 seconds while a stream is idle. Each subscription stream holds one Redis connection and counts toward `UPREST_MAX_CONNECTIONS`; size the limit for concurrent subscribers plus ordinary commands. Closing or aborting the HTTP request unsubscribes it. `MONITOR` is not supported.
 
 ### `@upstash/ratelimit` (optional)
 
@@ -150,7 +173,7 @@ For multiple tokens or Redis backends, set `UPREST_MODE=file` and mount a JSON f
 }
 ```
 
-Each token selects its configured Redis backend. `max_connections` is optional and defaults to `3`. Redis pools are opened when first used and closed after the idle timeout.
+Each token selects its configured Redis backend. `max_connections` is optional and defaults to `3`. Redis pools are opened when first used and closed after the idle timeout. Each active Pub/Sub SSE stream occupies one connection from this same limit.
 
 ## Documentation
 

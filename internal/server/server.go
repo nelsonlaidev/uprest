@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,16 +24,22 @@ import (
 
 const maxBodySize = 10 << 20
 const commandTimeout = 30 * time.Second
+const subscriptionHeartbeatInterval = 15 * time.Second
+const subscriptionWriteTimeout = 5 * time.Second
 const syncTokenHeader = "Upstash-Sync-Token" //nolint:gosec // G101: HTTP header name, not a credential
 const responseFormatHeader = "Upstash-Response-Format"
 const responseEncodingHeader = "Upstash-Encoding"
 const invalidResponseFormatMessage = "Invalid response format"
 const invalidResponseEncodingMessage = "Invalid response encoding"
+const invalidSubscriptionMessage = "Invalid subscription"
 const redisUnavailableMessage = "Redis unavailable"
+const subscriptionHeartbeat = ": keepalive\n\n"
 
 var requestSequence atomic.Uint64
 var errInvalidResponseFormat = errors.New(invalidResponseFormatMessage)     //nolint:staticcheck // ST1005: external HTTP API message.
 var errInvalidResponseEncoding = errors.New(invalidResponseEncodingMessage) //nolint:staticcheck // ST1005: external HTTP API message.
+var errInvalidSubscription = errors.New(invalidSubscriptionMessage)         //nolint:staticcheck // ST1005: external HTTP API message.
+var errInvalidSubscriptionEvent = errors.New("subscription event contains a line break")
 
 type requestIDContextKey struct{}
 
@@ -100,22 +107,42 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set(syncTokenHeader, newRequestID())
 
-	if unsupportedEndpoint(r.URL.Path) {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Not Found"})
-		return
-	}
+	patternSubscription, subscription := subscriptionRoute(r.URL.Path)
+	var subscriptionNames []string
+	var resp2Response bool
+	var err error
 
-	if r.Method != http.MethodPost && (r.Method != http.MethodGet || reservedPath(r.URL.Path)) {
-		w.Header().Set("Allow", allowedMethods(r.URL.Path))
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
-		return
-	}
+	if subscription {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+			return
+		}
 
-	resp2Response, err := responseUsesRESP2(r)
+		subscriptionNames, err = decodeSubscriptionNames(r.URL.EscapedPath())
 
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	} else {
+		if unsupportedEndpoint(r.URL.Path) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "Not Found"})
+			return
+		}
+
+		if r.Method != http.MethodPost && (r.Method != http.MethodGet || reservedPath(r.URL.Path)) {
+			w.Header().Set("Allow", allowedMethods(r.URL.Path))
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+			return
+		}
+
+		resp2Response, err = responseUsesRESP2(r)
+
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	client, release, err := h.pools.Acquire(token)
@@ -131,6 +158,11 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer release()
+
+	if subscription {
+		h.serveSubscription(w, r, client, subscriptionNames, patternSubscription)
+		return
+	}
 
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/":
@@ -148,6 +180,87 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Allow", allowedMethods(r.URL.Path))
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+	}
+}
+
+func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, client *redis.Client, names []string, pattern bool) {
+	var pubsub *redis.PubSub
+
+	if pattern {
+		pubsub = client.PSubscribe(r.Context(), names...)
+	} else {
+		pubsub = client.Subscribe(r.Context(), names...)
+	}
+
+	defer func() {
+		_ = pubsub.Close()
+	}()
+
+	confirmation, err := pubsub.ReceiveTimeout(r.Context(), commandTimeout)
+
+	if err != nil {
+		if r.Context().Err() == nil {
+			writeRedisUnavailable(w)
+		}
+
+		return
+	}
+
+	firstEvent, err := formatSubscriptionEvent(confirmation)
+
+	if err != nil || len(firstEvent) == 0 {
+		writeRedisUnavailable(w)
+		return
+	}
+
+	controller := http.NewResponseController(w)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	if err := writeSSE(w, controller, firstEvent); err != nil {
+		return
+	}
+
+	events := pubsub.ChannelWithSubscriptions()
+	heartbeat := time.NewTimer(subscriptionHeartbeatInterval)
+
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+
+		case event, open := <-events:
+			if !open {
+				return
+			}
+
+			body, err := formatSubscriptionEvent(event)
+
+			if err != nil {
+				return
+			}
+
+			if len(body) == 0 {
+				continue
+			}
+
+			if err := writeSSE(w, controller, body); err != nil {
+				return
+			}
+
+			heartbeat.Reset(subscriptionHeartbeatInterval)
+
+		case <-heartbeat.C:
+			if err := writeSSE(w, controller, []byte(subscriptionHeartbeat)); err != nil {
+				return
+			}
+
+			heartbeat.Reset(subscriptionHeartbeatInterval)
+		}
 	}
 }
 
@@ -375,16 +488,49 @@ func reservedPath(path string) bool {
 	return path == "/" || path == "/pipeline" || path == "/multi-exec"
 }
 
-func unsupportedEndpoint(path string) bool {
+func subscriptionRoute(path string) (pattern bool, ok bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	segment, _, _ := strings.Cut(trimmed, "/")
 
 	switch strings.ToLower(segment) {
-	case "monitor", "psubscribe", "subscribe":
-		return true
+	case "subscribe":
+		return false, true
+
+	case "psubscribe":
+		return true, true
+
+	default:
+		return false, false
+	}
+}
+
+func decodeSubscriptionNames(escapedPath string) ([]string, error) {
+	command, err := upstash.DecodePathCommand(escapedPath, "", nil)
+
+	if err != nil || len(command) < 2 {
+		return nil, errInvalidSubscription
 	}
 
-	return false
+	names := make([]string, len(command)-1)
+
+	for i, value := range command[1:] {
+		name, ok := value.(string)
+
+		if !ok || name == "" || containsSSELineBreak(name) {
+			return nil, errInvalidSubscription
+		}
+
+		names[i] = name
+	}
+
+	return names, nil
+}
+
+func unsupportedEndpoint(path string) bool {
+	trimmed := strings.TrimPrefix(path, "/")
+	segment, _, _ := strings.Cut(trimmed, "/")
+
+	return strings.EqualFold(segment, "monitor")
 }
 
 func allowedMethods(path string) string {
@@ -435,6 +581,67 @@ func commandResponse(result any, err error, base64Response bool) (map[string]any
 	}
 
 	return map[string]any{"result": result}, http.StatusOK
+}
+
+func formatSubscriptionEvent(event any) ([]byte, error) {
+	switch value := event.(type) {
+	case *redis.Subscription:
+		if containsSSELineBreak(value.Kind, value.Channel) {
+			return nil, errInvalidSubscriptionEvent
+		}
+
+		return fmt.Appendf(nil, "data: %s,%s,%d\n\n", value.Kind, value.Channel, value.Count), nil
+
+	case *redis.Message:
+		if containsSSELineBreak(value.Pattern, value.Channel, value.Payload) {
+			return nil, errInvalidSubscriptionEvent
+		}
+
+		if value.Pattern != "" {
+			return fmt.Appendf(nil, "data: pmessage,%s,%s,%s\n\n", value.Pattern, value.Channel, value.Payload), nil
+		}
+
+		return fmt.Appendf(nil, "data: message,%s,%s\n\n", value.Channel, value.Payload), nil
+
+	default:
+		return nil, nil
+	}
+}
+
+func writeSSE(w http.ResponseWriter, controller *http.ResponseController, body []byte) error {
+	deadlineSupported := true
+
+	if err := controller.SetWriteDeadline(time.Now().Add(subscriptionWriteTimeout)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+
+		deadlineSupported = false
+	}
+
+	if _, err := w.Write(body); err != nil {
+		return err
+	}
+
+	if err := controller.Flush(); err != nil {
+		return err
+	}
+
+	if deadlineSupported {
+		return controller.SetWriteDeadline(time.Time{})
+	}
+
+	return nil
+}
+
+func containsSSELineBreak(values ...string) bool {
+	for _, value := range values {
+		if strings.ContainsAny(value, "\r\n") {
+			return true
+		}
+	}
+
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

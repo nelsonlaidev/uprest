@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -470,6 +471,212 @@ func TestMultiTenantTokenRoutingWithRedis(t *testing.T) {
 	}
 }
 
+func TestSubscribeWithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+	handler := redisIntegrationHandler(t)
+	httpServer := httptest.NewServer(handler)
+
+	t.Cleanup(httpServer.Close)
+
+	prefix := fmt.Sprintf("uprest:subscribe:%d", time.Now().UnixNano())
+	firstChannel := prefix + ":first"
+	secondChannel := prefix + ":second"
+	path := "/subscribe/" + url.PathEscape(firstChannel) + "/" + url.PathEscape(secondChannel)
+	response, reader, _ := openSubscription(t, httpServer.URL, path, map[string]string{ //nolint:bodyclose // openSubscription registers response cleanup.
+		responseEncodingHeader: "base64",
+		responseFormatHeader:   "resp2",
+	})
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", response.StatusCode)
+	}
+
+	if response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("got content type %q, want text/event-stream", response.Header.Get("Content-Type"))
+	}
+
+	if response.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatalf("got cache control %q, want no-cache", response.Header.Get("Cache-Control"))
+	}
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", firstChannel) {
+		t.Fatalf("got first confirmation %q", got)
+	}
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,2\n\n", secondChannel) {
+		t.Fatalf("got second confirmation %q", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	defer cancel()
+
+	messages := []struct {
+		channel string
+		payload string
+	}{
+		{firstChannel, "first"},
+		{secondChannel, `{"kind":"json","value":1}`},
+		{firstChannel, "third"},
+	}
+
+	for _, message := range messages {
+		if err := client.Publish(ctx, message.channel, message.payload).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, message := range messages {
+		want := fmt.Sprintf("data: message,%s,%s\n\n", message.channel, message.payload)
+
+		if got := readSSEEvent(t, reader, 5*time.Second); got != want {
+			t.Fatalf("got message %q, want %q", got, want)
+		}
+	}
+
+	secondResponse, secondReader, _ := openSubscription(t, httpServer.URL, "/subscribe/"+url.PathEscape(firstChannel), nil) //nolint:bodyclose // openSubscription registers response cleanup.
+
+	if got := readSSEEvent(t, secondReader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", firstChannel) {
+		t.Fatalf("got second subscriber confirmation %q", got)
+	}
+
+	if subscribers, err := client.Publish(ctx, firstChannel, "shared").Result(); err != nil {
+		t.Fatal(err)
+	} else if subscribers != 2 {
+		t.Fatalf("got %d subscribers, want 2", subscribers)
+	}
+
+	wantShared := fmt.Sprintf("data: message,%s,shared\n\n", firstChannel)
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != wantShared {
+		t.Fatalf("got first shared message %q, want %q", got, wantShared)
+	}
+
+	if got := readSSEEvent(t, secondReader, 5*time.Second); got != wantShared {
+		t.Fatalf("got second shared message %q, want %q", got, wantShared)
+	}
+
+	if secondResponse.StatusCode != http.StatusOK {
+		t.Fatalf("got second subscriber status %d, want 200", secondResponse.StatusCode)
+	}
+}
+
+func TestPSubscribeWithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+	handler := redisIntegrationHandler(t)
+	httpServer := httptest.NewServer(handler)
+
+	t.Cleanup(httpServer.Close)
+
+	prefix := fmt.Sprintf("uprest:psubscribe:%d", time.Now().UnixNano())
+	pattern := prefix + ":*"
+	channel := prefix + ":one"
+	_, reader, _ := openSubscription(t, httpServer.URL, "/psubscribe/"+url.PathEscape(pattern), nil) //nolint:bodyclose // openSubscription registers response cleanup.
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: psubscribe,%s,1\n\n", pattern) {
+		t.Fatalf("got pattern confirmation %q", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	defer cancel()
+
+	if err := client.Publish(ctx, channel, "payload").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := fmt.Sprintf("data: pmessage,%s,%s,payload\n\n", pattern, channel)
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != want {
+		t.Fatalf("got pattern message %q, want %q", got, want)
+	}
+}
+
+func TestSubscriptionHeartbeatWithRedis(t *testing.T) {
+	handler := redisIntegrationHandler(t)
+	httpServer := httptest.NewServer(handler)
+
+	t.Cleanup(httpServer.Close)
+
+	channel := fmt.Sprintf("uprest:heartbeat:%d", time.Now().UnixNano())
+	_, reader, _ := openSubscription(t, httpServer.URL, "/subscribe/"+url.PathEscape(channel), nil) //nolint:bodyclose // openSubscription registers response cleanup.
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", channel) {
+		t.Fatalf("got confirmation %q", got)
+	}
+
+	started := time.Now()
+
+	if got := readSSEEvent(t, reader, 16*time.Second); got != subscriptionHeartbeat {
+		t.Fatalf("got heartbeat %q, want %q", got, subscriptionHeartbeat)
+	}
+
+	if elapsed := time.Since(started); elapsed > 16*time.Second {
+		t.Fatalf("heartbeat took %s, want no more than 16s", elapsed)
+	}
+}
+
+func TestSubscriptionCancellationReleasesLeaseWithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
+		Token:            "test-token",
+		ID:               "integration",
+		ConnectionString: redisIntegrationURL(t),
+		MaxConnections:   1,
+	}}, io.Discard)
+	httpServer := httptest.NewServer(handler)
+
+	t.Cleanup(httpServer.Close)
+
+	channel := fmt.Sprintf("uprest:cancel:%d", time.Now().UnixNano())
+	response, reader, cancel := openSubscription(t, httpServer.URL, "/subscribe/"+url.PathEscape(channel), nil)
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", channel) {
+		t.Fatalf("got confirmation %q", got)
+	}
+
+	cancel()
+	_ = response.Body.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		ctx, stop := context.WithTimeout(context.Background(), time.Second)
+		subscriptions, err := client.PubSubNumSub(ctx, channel).Result()
+		stop()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if subscriptions[channel] == 0 {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("PubSub connection remained subscribed after request cancellation")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closed := make(chan error, 1)
+
+	go func() {
+		closed <- manager.Close()
+	}()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager close waited for the canceled subscription lease")
+	}
+}
+
 func redisIntegrationClient(t *testing.T) *redis.Client {
 	t.Helper()
 
@@ -563,4 +770,80 @@ func servePathCommand(t *testing.T, handler http.Handler, method string, path st
 	handler.ServeHTTP(response, request)
 
 	return response
+}
+
+func openSubscription(t *testing.T, serverURL string, path string, headers map[string]string) (*http.Response, *bufio.Reader, context.CancelFunc) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL+path, nil)
+
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	request.Header.Set("Authorization", "Bearer test-token")
+
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		cancel()
+		_ = response.Body.Close()
+	})
+
+	return response, bufio.NewReader(response.Body), cancel
+}
+
+func readSSEEvent(t *testing.T, reader *bufio.Reader, timeout time.Duration) string {
+	t.Helper()
+
+	type result struct {
+		event string
+		err   error
+	}
+
+	resultChannel := make(chan result, 1)
+
+	go func() {
+		var event strings.Builder
+
+		for {
+			line, err := reader.ReadString('\n')
+
+			if err != nil {
+				resultChannel <- result{err: err}
+				return
+			}
+
+			event.WriteString(line)
+
+			if line == "\n" {
+				resultChannel <- result{event: event.String()}
+				return
+			}
+		}
+	}()
+
+	select {
+	case received := <-resultChannel:
+		if received.err != nil {
+			t.Fatal(received.err)
+		}
+
+		return received.event
+
+	case <-time.After(timeout):
+		t.Fatalf("timed out after %s waiting for an SSE event", timeout)
+		return ""
+	}
 }
