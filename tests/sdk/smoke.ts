@@ -21,6 +21,7 @@ const countKey = `${prefix}:count`
 const hashKey = `${prefix}:hash`
 const listKey = `${prefix}:list`
 const transactionKey = `${prefix}:transaction`
+const subscriptionChannel = `${prefix}:subscription`
 
 try {
   assert.equal(await redis.set(valueKey, 'hello'), 'OK')
@@ -49,6 +50,48 @@ try {
   transaction.get(transactionKey)
 
   assert.deepEqual(await transaction.exec(), ['OK', 1, 1])
+
+  const subscriber = redis.subscribe<{ source: string; value: number }>(subscriptionChannel)
+
+  try {
+    const message = await new Promise<{ channel: string; message: { source: string; value: number } }>(
+      (resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timed out waiting for subscription message')), 5_000)
+
+        subscriber.on('error', (error) => {
+          clearTimeout(timeout)
+          reject(error)
+        })
+
+        subscriber.on('subscribe', (count) => {
+          try {
+            assert.equal(count, 1)
+          } catch (error) {
+            clearTimeout(timeout)
+            reject(error)
+            return
+          }
+
+          void redis.publish(subscriptionChannel, { source: 'sdk', value: 1 }).catch((error) => {
+            clearTimeout(timeout)
+            reject(error)
+          })
+        })
+
+        subscriber.on('message', (event) => {
+          clearTimeout(timeout)
+          resolve(event)
+        })
+      },
+    )
+
+    assert.deepEqual(message, {
+      channel: subscriptionChannel,
+      message: { source: 'sdk', value: 1 },
+    })
+  } finally {
+    await subscriber.unsubscribe()
+  }
 
   const algorithms = [
     ['fixed-window', Ratelimit.fixedWindow(1, '1 m')],

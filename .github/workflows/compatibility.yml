@@ -45,6 +45,7 @@ jobs:
       UPSTREAM_REF: ${{ inputs.upstream_ref || (github.event_name == 'schedule' && 'main') || '6b2772753067e7d1aa103de25a3ee37bfd98093a' }}
       UPSTASH_REDIS_REST_URL: http://localhost:8079
       UPSTASH_REDIS_REST_TOKEN: compatibility-token
+      UPREST_MAX_CONNECTIONS: 16
 
     services:
       redis:
@@ -72,6 +73,7 @@ jobs:
             --env UPREST_PORT=8079 \
             --env UPREST_TOKEN="$UPSTASH_REDIS_REST_TOKEN" \
             --env UPREST_CONNECTION_STRING=redis://localhost:6379 \
+            --env UPREST_MAX_CONNECTIONS="$UPREST_MAX_CONNECTIONS" \
             uprest:compatibility
 
           for attempt in {1..30}; do
