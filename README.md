@@ -2,7 +2,7 @@
 
 uprest is a local HTTP-to-Redis proxy for applications that use the Upstash Redis REST API. It forwards requests to a real Redis server, so your application can use `@upstash/redis` during local development and CI.
 
-It supports commands, pipelines, transactions, and bearer-token or `_token` query authentication. It also adapts the Upstash-specific Lua flag used by recent `@upstash/ratelimit` versions so those scripts run on Redis.
+It supports commands, pipelines, transactions, JSON or RESP2 responses, and bearer-token or `_token` query authentication. It also adapts the Upstash-specific Lua flag used by recent `@upstash/ratelimit` versions so those scripts run on Redis.
 
 ## Quick start
 
@@ -64,6 +64,8 @@ curl -X POST http://localhost:8079/ \
 ```
 
 The response is `{"result":"OK"}`.
+
+Set `Upstash-Response-Format: resp2` to receive the raw Redis reply with an `application/octet-stream` content type. RESP2 is available for individual commands and pipelines; transactions at `/multi-exec` always return JSON.
 
 ### `@upstash/ratelimit` (optional)
 

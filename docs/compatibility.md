@@ -12,11 +12,11 @@ uprest accepts authenticated Upstash-style commands over HTTP and forwards them 
 | `/<command>/<args...>` | `GET`  | URL-encoded arguments                                     |
 | `/<command>/<args...>` | `POST` | URL arguments plus raw request body as the final argument |
 
-An empty path-command `POST` body is an empty Redis argument. Use `GET` when no body argument is needed. Add `Upstash-Encoding: base64` to encode string results.
+An empty path-command `POST` body is an empty Redis argument. Use `GET` when no body argument is needed. Add `Upstash-Encoding: base64` to encode string results in JSON responses. Set `Upstash-Response-Format: resp2` to return raw RESP2 bytes with an `application/octet-stream` content type for individual commands and pipelines. Pipeline replies are concatenated in command order, matching Redis pipelining. The `/multi-exec` endpoint always returns JSON. Combining RESP2 with base64 encoding or requesting a response format other than `json` or `resp2` returns JSON 400.
 
-Streaming endpoints such as `/subscribe/<channel>` and `/monitor` are unsupported and return JSON 404 after authentication. Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. If an `Authorization` header is present, it takes precedence; an invalid or malformed header returns 401 without falling back to `_token`. Only JSON responses are supported; `Upstash-Response-Format: resp2` and `HEAD` or `PUT` command requests are unsupported.
+Streaming endpoints such as `/subscribe/<channel>` and `/monitor` are unsupported and return JSON 404 after authentication. Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. If an `Authorization` header is present, it takes precedence; an invalid or malformed header returns 401 without falling back to `_token`. `HEAD` and `PUT` command requests are unsupported.
 
-Errors use `{"error":"..."}`. Invalid commands, pipelines, and transactions return 400, as does a single command rejected by Redis. A command error inside a pipeline or transaction appears as an `{"error":"..."}` entry in a 200 response. Missing or invalid tokens return 401, unsupported methods return 405, unavailable Redis backends return 502, and connection acquisition failures return 503. Request bodies are limited to 10 MiB.
+JSON errors use `{"error":"..."}`. Invalid commands, pipelines, and transactions return 400, as does a single command rejected by Redis. With RESP2 enabled, a Redis command error is returned as a raw error reply with status 400, while an error inside a pipeline remains one of the concatenated replies in a 200 response. Request validation and infrastructure failures remain JSON. Missing or invalid tokens return 401, unsupported methods return 405, unavailable Redis backends return 502, and connection acquisition failures return 503. Request bodies are limited to 10 MiB.
 
 ## Lua scripts
 

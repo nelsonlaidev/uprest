@@ -24,8 +24,15 @@ import (
 const maxBodySize = 10 << 20
 const commandTimeout = 30 * time.Second
 const syncTokenHeader = "Upstash-Sync-Token" //nolint:gosec // G101: HTTP header name, not a credential
+const responseFormatHeader = "Upstash-Response-Format"
+const responseEncodingHeader = "Upstash-Encoding"
+const invalidResponseFormatMessage = "Invalid response format"
+const invalidResponseEncodingMessage = "Invalid response encoding"
+const redisUnavailableMessage = "Redis unavailable"
 
 var requestSequence atomic.Uint64
+var errInvalidResponseFormat = errors.New(invalidResponseFormatMessage)     //nolint:staticcheck // ST1005: external HTTP API message.
+var errInvalidResponseEncoding = errors.New(invalidResponseEncodingMessage) //nolint:staticcheck // ST1005: external HTTP API message.
 
 type requestIDContextKey struct{}
 
@@ -98,6 +105,19 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method != http.MethodPost && (r.Method != http.MethodGet || reservedPath(r.URL.Path)) {
+		w.Header().Set("Allow", allowedMethods(r.URL.Path))
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+		return
+	}
+
+	resp2Response, err := responseUsesRESP2(r)
+
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
 	client, release, err := h.pools.Acquire(token)
 
 	if errors.Is(err, redisproxy.ErrUnauthorized) {
@@ -114,16 +134,16 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/":
-		h.serveBodyCommand(w, r, client)
+		h.serveBodyCommand(w, r, client, resp2Response)
 
 	case r.Method == http.MethodPost && r.URL.Path == "/pipeline":
-		h.serveBatch(w, r, client, false)
+		h.serveBatch(w, r, client, false, resp2Response)
 
 	case r.Method == http.MethodPost && r.URL.Path == "/multi-exec":
-		h.serveBatch(w, r, client, true)
+		h.serveBatch(w, r, client, true, false)
 
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && !reservedPath(r.URL.Path):
-		h.servePathCommand(w, r, client)
+		h.servePathCommand(w, r, client, resp2Response)
 
 	default:
 		w.Header().Set("Allow", allowedMethods(r.URL.Path))
@@ -131,7 +151,7 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *apiHandler) serveBodyCommand(w http.ResponseWriter, r *http.Request, client *redis.Client) {
+func (h *apiHandler) serveBodyCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, resp2Response bool) {
 	command, err := upstash.DecodeCommand(requestBody(w, r))
 
 	if err != nil {
@@ -139,10 +159,10 @@ func (h *apiHandler) serveBodyCommand(w http.ResponseWriter, r *http.Request, cl
 		return
 	}
 
-	h.executeCommand(w, r, client, command)
+	h.executeCommand(w, r, client, command, resp2Response)
 }
 
-func (h *apiHandler) servePathCommand(w http.ResponseWriter, r *http.Request, client *redis.Client) {
+func (h *apiHandler) servePathCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, resp2Response bool) {
 	var body []byte
 
 	if r.Method == http.MethodPost {
@@ -162,15 +182,33 @@ func (h *apiHandler) servePathCommand(w http.ResponseWriter, r *http.Request, cl
 		return
 	}
 
-	h.executeCommand(w, r, client, command)
+	h.executeCommand(w, r, client, command, resp2Response)
 }
 
-func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, command []any) {
+func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, command []any, resp2Response bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), commandTimeout)
 
 	defer cancel()
 
 	h.normalizeCommand(r, command)
+
+	if resp2Response {
+		response, err := client.DoRaw(ctx, command...).Result()
+
+		if err != nil {
+			writeRedisUnavailable(w)
+			return
+		}
+
+		status := http.StatusOK
+
+		if len(response) > 0 && response[0] == '-' {
+			status = http.StatusBadRequest
+		}
+
+		writeRESP2(w, status, response)
+		return
+	}
 
 	result, err := client.Do(ctx, command...).Result()
 	response, status := commandResponse(result, err, responseUsesBase64(r))
@@ -178,7 +216,7 @@ func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, clie
 	writeJSON(w, status, response)
 }
 
-func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *redis.Client, transaction bool) {
+func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *redis.Client, transaction bool, resp2Response bool) {
 	commands, err := upstash.DecodePipeline(requestBody(w, r))
 
 	if err != nil {
@@ -195,6 +233,38 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 	ctx, cancel := context.WithTimeout(r.Context(), commandTimeout)
 
 	defer cancel()
+
+	if resp2Response {
+		pipeline := client.Pipeline()
+		results := make([]*redis.RawCmd, len(commands))
+
+		for i, command := range commands {
+			h.normalizeCommand(r, command)
+			results[i] = redis.NewRawCmd(ctx, command...)
+			_ = pipeline.Process(ctx, results[i]) // Pipeline.Process only queues commands and returns nil.
+		}
+
+		if _, err := pipeline.Exec(ctx); err != nil {
+			writeRedisUnavailable(w)
+			return
+		}
+
+		var response []byte
+
+		for _, result := range results {
+			item, err := result.Result()
+
+			if err != nil {
+				writeRedisUnavailable(w)
+				return
+			}
+
+			response = append(response, item...)
+		}
+
+		writeRESP2(w, http.StatusOK, response)
+		return
+	}
 
 	var pipeline redis.Pipeliner
 
@@ -216,7 +286,7 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 	var redisError redis.Error
 
 	if err != nil && !errors.Is(err, redis.Nil) && !errors.As(err, &redisError) {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "Redis unavailable"})
+		writeRedisUnavailable(w)
 		return
 	}
 
@@ -326,7 +396,25 @@ func allowedMethods(path string) string {
 }
 
 func responseUsesBase64(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upstash-Encoding"), "base64")
+	return strings.EqualFold(r.Header.Get(responseEncodingHeader), "base64")
+}
+
+func responseUsesRESP2(r *http.Request) (bool, error) {
+	format := r.Header.Get(responseFormatHeader)
+
+	if format == "" || strings.EqualFold(format, "json") {
+		return false, nil
+	}
+
+	if !strings.EqualFold(format, "resp2") {
+		return false, errInvalidResponseFormat
+	}
+
+	if responseUsesBase64(r) {
+		return false, errInvalidResponseEncoding
+	}
+
+	return true, nil
 }
 
 func commandResponse(result any, err error, base64Response bool) (map[string]any, int) {
@@ -339,7 +427,7 @@ func commandResponse(result any, err error, base64Response bool) (map[string]any
 			return map[string]any{"error": err.Error()}, http.StatusBadRequest
 		}
 
-		return map[string]any{"error": "Redis unavailable"}, http.StatusBadGateway
+		return map[string]any{"error": redisUnavailableMessage}, http.StatusBadGateway
 	}
 
 	if base64Response {
@@ -361,4 +449,15 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 
 	_, _ = w.Write(append(body, '\n'))
+}
+
+func writeRedisUnavailable(w http.ResponseWriter) {
+	writeJSON(w, http.StatusBadGateway, map[string]any{"error": redisUnavailableMessage})
+}
+
+func writeRESP2(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(status)
+
+	_, _ = w.Write(body) //nolint:gosec // G705: raw RESP2 bytes are intentionally proxied as application/octet-stream.
 }
