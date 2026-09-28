@@ -1,23 +1,26 @@
 # uprest
 
-uprest is a local HTTP-to-Redis proxy for applications that use the Upstash Redis REST API. It forwards requests to a real Redis server, so your application can use `@upstash/redis` during local development and CI.
+uprest is a local HTTP-to-Redis proxy for applications that use the Upstash Redis REST API. It forwards requests to a real Redis server, so applications can keep using `@upstash/redis` during local development and CI.
 
-It supports commands, pipelines, transactions, Redis Pub/Sub over Server-Sent Events, JSON or RESP2 responses, and bearer-token or `_token` query authentication. It also adapts the Upstash-specific Lua flag used by recent `@upstash/ratelimit` versions so those scripts run on Redis.
+It supports Redis commands, pipelines, transactions, Pub/Sub over Server-Sent Events (SSE), JSON and RESP2 responses, bearer or query-token authentication, and recent `@upstash/ratelimit` versions.
+
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [API compatibility](#api-compatibility)
+- [Deployment](#deployment)
+- [Migrate from SRH](#migrate-from-srh)
+- [Development and verification](#development-and-verification)
 
 ## Quick start
 
-Docker and Docker Compose are required. The examples use the published `ghcr.io/nelsonlaidev/uprest:v0.1.0` image.
-
-### Start Redis and uprest
-
-The quickest option is Compose, which starts Redis and uprest together:
+Docker and Docker Compose are required. Create a `docker-compose.yml` file:
 
 ```yaml
 services:
   redis:
     image: redis:8.10.2
   uprest:
-    image: ghcr.io/nelsonlaidev/uprest:v0.1.0
+    image: ghcr.io/nelsonlaidev/uprest:v0.2.0
     ports:
       - '8079:8080'
     environment:
@@ -25,20 +28,13 @@ services:
       UPREST_CONNECTION_STRING: redis://redis:6379
 ```
 
-Save it as `docker-compose.yml` and run `docker compose up -d`. If you already have a Redis server, start uprest on its own:
+Start both services:
 
 ```sh
-docker run --rm -d -p 8079:8080 --name uprest \
-  -e UPREST_TOKEN=example-token \
-  -e UPREST_CONNECTION_STRING=redis://your-redis-host:6379 \
-  ghcr.io/nelsonlaidev/uprest:v0.1.0
+docker compose up -d
 ```
 
-uprest listens on `8080` inside the image, and the port mapping above exposes it on `8079`. On macOS and Windows, Docker Desktop can reach a host Redis at `redis://host.docker.internal:6379`. Set your own token and Redis connection string outside local development.
-
-### Point `@upstash/redis` at it
-
-Use the uprest URL and token wherever you would use your Upstash credentials:
+Then point `@upstash/redis` at uprest:
 
 ```ts
 import { Redis } from '@upstash/redis'
@@ -52,9 +48,14 @@ await redis.set('hello', 'world')
 await redis.get('hello') // "world"
 ```
 
-`Redis.fromEnv()` reads `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`, so you can set those and leave application code unchanged.
+`Redis.fromEnv()` works without application changes when these variables are set:
 
-### Verify with curl
+```sh
+export UPSTASH_REDIS_REST_URL=http://localhost:8079
+export UPSTASH_REDIS_REST_TOKEN=example-token
+```
+
+Verify the service directly with curl:
 
 ```sh
 curl -X POST http://localhost:8079/ \
@@ -65,11 +66,76 @@ curl -X POST http://localhost:8079/ \
 
 The response is `{"result":"OK"}`.
 
-Set `Upstash-Response-Format: resp2` to receive the raw Redis reply with an `application/octet-stream` content type. RESP2 is available for individual commands and pipelines; transactions at `/multi-exec` always return JSON.
+To connect uprest to an existing Redis server instead, run only the proxy:
 
-### Pub/Sub streaming
+```sh
+docker run --rm -d -p 8079:8080 --name uprest \
+  -e UPREST_TOKEN=example-token \
+  -e UPREST_CONNECTION_STRING=redis://your-redis-host:6379 \
+  ghcr.io/nelsonlaidev/uprest:v0.2.0
+```
 
-`@upstash/redis` subscriptions work through authenticated `POST /subscribe/<channel...>` and `POST /psubscribe/<pattern...>` Server-Sent Event streams:
+The image listens on port `8080`. On macOS and Windows, Docker Desktop can reach Redis on the host at `redis://host.docker.internal:6379`. Use a private token and an appropriate Redis URL outside local development.
+
+## Configuration
+
+uprest reads `UPREST_*` environment variables. `UPREST_MODE` selects one Redis backend from environment variables or multiple backends from a JSON file.
+
+| Variable                   | Default                          | Purpose                                               |
+| -------------------------- | -------------------------------- | ----------------------------------------------------- |
+| `UPREST_MODE`              | `env`                            | Configuration source: `env` or `file`                 |
+| `UPREST_TOKEN`             | Required in `env` mode           | HTTP authentication token                             |
+| `UPREST_CONNECTION_STRING` | Required in `env` mode           | Redis URL, such as `redis://redis:6379`               |
+| `UPREST_MAX_CONNECTIONS`   | `3`                              | Maximum active connections for the `env` mode backend |
+| `UPREST_TOKENS_FILE`       | `/app/uprest-config/tokens.json` | Tokens file path in `file` mode                       |
+| `UPREST_PORT`              | `80` (`8080` in the image)       | HTTP listen port                                      |
+| `UPREST_IPV6`              | `false`                          | Listen on IPv6                                        |
+| `UPREST_IDLE_TIMEOUT`      | `15m`                            | Time before an idle Redis pool closes                 |
+| `UPREST_LOG_LEVEL`         | `info`                           | JSON log level: `debug`, `info`, `warn`, or `error`   |
+
+### Multiple tokens or backends
+
+Set `UPREST_MODE=file` and mount a JSON file at `/app/uprest-config/tokens.json`, or change the location with `UPREST_TOKENS_FILE`:
+
+```json
+{
+  "example-token": {
+    "id": "primary",
+    "connection_string": "redis://redis:6379",
+    "max_connections": 3
+  }
+}
+```
+
+Each token selects its configured Redis backend. `max_connections` is optional and defaults to `3`. Redis pools open on first use and close after the idle timeout. `UPREST_TOKEN` and `UPREST_CONNECTION_STRING` are ignored in file mode.
+
+## API compatibility
+
+### Routes
+
+| Endpoint                   | Method | Request                                             |
+| -------------------------- | ------ | --------------------------------------------------- |
+| `/`                        | `POST` | JSON command array                                  |
+| `/pipeline`                | `POST` | JSON array of commands                              |
+| `/multi-exec`              | `POST` | JSON array of commands run in Redis `MULTI`/`EXEC`  |
+| `/subscribe/<channel...>`  | `POST` | One or more URL-encoded Pub/Sub channels            |
+| `/psubscribe/<pattern...>` | `POST` | One or more URL-encoded Pub/Sub patterns            |
+| `/<command>/<args...>`     | `GET`  | URL-encoded arguments                               |
+| `/<command>/<args...>`     | `POST` | URL arguments and the body as the final Redis value |
+
+Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. An `Authorization` header takes precedence and does not fall back to `_token` when malformed or invalid.
+
+An empty path-command `POST` body becomes an empty Redis argument; use `GET` when no body argument is needed. Request bodies are limited to 10 MiB. `HEAD` and `PUT` command requests are unsupported.
+
+### Responses and errors
+
+JSON is the default response format. Add `Upstash-Encoding: base64` to base64-encode string results, or set `Upstash-Response-Format: resp2` for raw RESP2 bytes on individual commands and pipelines. Transactions at `/multi-exec` always return JSON. RESP2 cannot be combined with base64 encoding.
+
+JSON errors use `{"error":"..."}`. Validation and Redis command errors return `400`; authentication failures return `401`; unsupported methods return `405`; unavailable Redis backends return `502`; and connection acquisition failures return `503`. A Redis error inside a RESP2 pipeline remains one reply in the concatenated `200` response.
+
+### Pub/Sub
+
+`@upstash/redis` subscriptions work through authenticated SSE streams:
 
 ```ts
 const subscriber = redis.subscribe<{ text: string }>('updates')
@@ -84,33 +150,36 @@ await new Promise<void>((resolve, reject) => {
 })
 
 await redis.publish('updates', { text: 'hello' })
-
 await subscriber.unsubscribe()
 ```
 
-uprest sends an SSE comment heartbeat every 15 seconds while a stream is idle. Each subscription stream holds one Redis connection and counts toward `UPREST_MAX_CONNECTIONS`; size the limit for concurrent subscribers plus ordinary commands. Closing or aborting the HTTP request unsubscribes it. `MONITOR` is not supported.
+An idle stream receives an SSE heartbeat every 15 seconds. Closing or aborting the request unsubscribes it. Each stream holds one Redis connection and counts toward `UPREST_MAX_CONNECTIONS` or the backend's `max_connections` limit.
 
-### `@upstash/ratelimit` (optional)
+Channel and pattern names containing CR or LF are rejected. Commas are unsupported by the SDK parser, and a message payload containing CR or LF ends the stream. `MONITOR` is not supported.
 
-uprest works with `@upstash/ratelimit` regardless of version. From 2.1.0 onward, the SDK prepends the Upstash-only `allow-key-locking` Lua flag; uprest strips it before forwarding scripts to Redis, so those scripts run on stock Redis:
+### Rate limiting
 
-```ts
-import { Redis } from '@upstash/redis'
-import { Ratelimit } from '@upstash/ratelimit'
+uprest works with `@upstash/ratelimit`, including versions 2.1.0 and later. It removes the Upstash-only `allow-key-locking` Lua flag before forwarding scripts to Redis and maps subsequent `EVALSHA` requests to the normalized script.
 
-const ratelimit = new Ratelimit({
-  redis: new Redis({ url: 'http://localhost:8079', token: 'example-token' }),
-  limiter: Ratelimit.slidingWindow(10, '10 s'),
-})
+### Known differences
 
-const { success } = await ratelimit.limit('user-123')
-```
+Upstash Search and Vector commands, `MONITOR` streaming, some RedisJSON response details, and selected Upstash-specific command behavior are not supported. The compatibility exclusions are documented in [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt).
 
-## CI (GitHub Actions)
+uprest returns an opaque `Upstash-Sync-Token`, but it does not coordinate replicas with an incoming token because each authentication token routes to one Redis backend.
 
-uprest works as a service container alongside Redis, so CI jobs do not need a real Upstash database:
+### Operations
 
-```yml
+Request, pool lifecycle, and shutdown events use structured JSON logs without bearer tokens or Redis connection strings. Set `UPREST_LOG_LEVEL=debug` to include script-normalization events.
+
+The server uses a 5-second header-read timeout, 15-second read timeout, 50-second write timeout, and 60-second keep-alive timeout. Redis commands and initial Pub/Sub confirmation have a 30-second deadline. On shutdown, active request contexts are cancelled before the server waits up to 10 seconds for handlers to exit.
+
+## Deployment
+
+### GitHub Actions
+
+uprest can run as a service container alongside Redis, so CI does not need an Upstash database:
+
+```yaml
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -118,7 +187,7 @@ jobs:
       redis:
         image: redis:8.10.2
       uprest:
-        image: ghcr.io/nelsonlaidev/uprest:v0.1.0
+        image: ghcr.io/nelsonlaidev/uprest:v0.2.0
         env:
           UPREST_TOKEN: example-token
           UPREST_CONNECTION_STRING: redis://redis:6379
@@ -130,59 +199,68 @@ jobs:
           UPSTASH_REDIS_REST_TOKEN: example-token
 ```
 
-Service containers require a Linux runner such as `ubuntu-latest`. Reference the uprest service by its name (`http://uprest:8080`) on the internal network; no ports need to be published.
+Service containers require a Linux runner. Services reach each other by name on the internal network, so no port needs to be published.
 
-## Releases
+### Releases
 
-Release archives for Linux, macOS, and Windows are available on the [GitHub Releases page](https://github.com/nelsonlaidev/uprest/releases). Each archive includes the executable, README, CHANGELOG, and MIT license. Verify downloads with the published `checksums.txt` file.
+Linux, macOS, and Windows archives are available on the [GitHub Releases page](https://github.com/nelsonlaidev/uprest/releases). Each archive includes the executable, README, changelog, and MIT license. Verify downloads with the published `checksums.txt` file.
 
-The Linux container image is published for amd64 and arm64 in both registries:
+Multi-architecture Linux images are published to both registries:
 
 ```sh
-docker pull ghcr.io/nelsonlaidev/uprest:v0.1.0
-docker pull nelsonlaidev/uprest:v0.1.0
+docker pull ghcr.io/nelsonlaidev/uprest:v0.2.0
+docker pull nelsonlaidev/uprest:v0.2.0
 ```
 
-Both registries also publish a `latest` tag for stable releases. See [CHANGELOG.md](CHANGELOG.md) for release history.
+Stable releases also use the `latest` tag. See [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
-## Configuration
+## Migrate from SRH
 
-uprest reads `UPREST_*` environment variables. `UPREST_MODE` selects the configuration source: `env` (the default) serves one Redis backend, while `file` loads one or more tokens from a JSON file.
+When migrating from [`hiett/serverless-redis-http`](https://github.com/hiett/serverless-redis-http) (SRH), update these environment variables:
 
-| Variable                   | Default                          | Purpose                                               |
-| -------------------------- | -------------------------------- | ----------------------------------------------------- |
-| `UPREST_MODE`              | `env`                            | Configuration source: `env` or `file`                 |
-| `UPREST_TOKEN`             | Required in `env` mode           | HTTP authentication token                             |
-| `UPREST_CONNECTION_STRING` | Required in `env` mode           | Redis URL, such as `redis://redis:6379`               |
-| `UPREST_MAX_CONNECTIONS`   | `3`                              | Maximum active connections for the `env` mode backend |
-| `UPREST_TOKENS_FILE`       | `/app/uprest-config/tokens.json` | Tokens file path in `file` mode                       |
-| `UPREST_PORT`              | `80` (`8080` in the image)       | HTTP listen port                                      |
-| `UPREST_IPV6`              | `false`                          | Listen on IPv6                                        |
-| `UPREST_IDLE_TIMEOUT`      | `15m`                            | Time before an idle Redis pool closes                 |
-| `UPREST_LOG_LEVEL`         | `info`                           | JSON log level: `debug`, `info`, `warn`, or `error`   |
+| SRH                     | uprest                     |
+| ----------------------- | -------------------------- |
+| `SRH_MODE`              | `UPREST_MODE`              |
+| `SRH_TOKEN`             | `UPREST_TOKEN`             |
+| `SRH_CONNECTION_STRING` | `UPREST_CONNECTION_STRING` |
+| `SRH_MAX_CONNECTIONS`   | `UPREST_MAX_CONNECTIONS`   |
+| `SRH_PORT`              | `UPREST_PORT`              |
+| `SRH_IPV6`              | `UPREST_IPV6`              |
 
-For multiple tokens or Redis backends, set `UPREST_MODE=file` and mount a JSON file at `/app/uprest-config/tokens.json`, or set `UPREST_TOKENS_FILE` to another path. `UPREST_TOKEN` and `UPREST_CONNECTION_STRING` are only used in `env` mode; in `file` mode they are ignored.
+`UPREST_MODE=env` is the default. Existing token and Redis URL values can stay the same. The container listens on port `8080`; update the client REST URL if the Compose service name changes.
 
-```json
-{
-  "example-token": {
-    "id": "primary",
-    "connection_string": "redis://redis:6379",
-    "max_connections": 3
-  }
-}
+For file mode, set `UPREST_MODE=file`, rename each token entry's `srh_id` field to `id`, and change the default mount destination from `/app/srh-config/tokens.json` to `/app/uprest-config/tokens.json`. A file containing only `srh_id` fails validation.
+
+After switching, send a `PING` request with the existing token and run the application's SDK tests against the new REST URL. Applications using a recent `@upstash/ratelimit` version should also exercise a Lua-based limiter.
+
+## Development and verification
+
+Run the standard Go checks:
+
+```sh
+go test ./...
+go vet ./...
 ```
 
-Each token selects its configured Redis backend. `max_connections` is optional and defaults to `3`. Redis pools are opened when first used and closed after the idle timeout. Each active Pub/Sub SSE stream occupies one connection from this same limit.
+The bundled [`examples/docker-compose.yml`](examples/docker-compose.yml) builds uprest from source:
 
-## Documentation
+```sh
+just up
+just sdk-install
+just sdk-test
+```
 
-- [Migrate from SRH](docs/migrating-from-srh.md) for configuration and token-file changes.
-- [API coverage and verification](docs/compatibility.md) for supported routes, known gaps, and test instructions.
+The SDK tests cover `@upstash/redis` commands, pipelines, and transactions, plus the fixed-window, sliding-window, and token-bucket algorithms from `@upstash/ratelimit`.
 
-## Development
+The compatibility workflow also runs the official `upstash/redis-js` `packages/redis` suite. Pull requests and pushes to `main` use pinned upstream commit `6b2772753067e7d1aa103de25a3ee37bfd98093a`; the scheduled workflow tests upstream `main`.
 
-Run `go test ./...` and `go vet ./...` for the Go code. The bundled [Compose example](examples/docker-compose.yml) builds uprest from source; with it running, `just sdk-install` and `just sdk-test` exercise the installed `@upstash/redis` and `@upstash/ratelimit` SDKs.
+To run that suite locally, start Redis and uprest, clone `upstash/redis-js`, then run:
+
+```sh
+tests/compatibility/run.sh /path/to/redis-js
+```
+
+The script modifies the checkout without committing, so use a disposable clone. Its exclusions and adaptations live in [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt) and [`tests/compatibility/upstream.patch`](tests/compatibility/upstream.patch).
 
 ## License
 
