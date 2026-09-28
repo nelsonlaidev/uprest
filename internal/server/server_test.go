@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -220,6 +221,149 @@ func TestUnsupportedEndpointDoesNotCreatePool(t *testing.T) {
 
 	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
 		t.Fatalf("unsupported endpoints created a Redis pool: %+v", stats)
+	}
+}
+
+func TestResponseFormatValidation(t *testing.T) {
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
+		Token:            "test-token",
+		ID:               "test",
+		ConnectionString: "redis://localhost:1",
+		MaxConnections:   3,
+	}}, io.Discard)
+
+	for _, test := range []struct {
+		name      string
+		path      string
+		format    string
+		encoding  string
+		wantError string
+	}{
+		{"unknown format", "/", "xml", "", invalidResponseFormatMessage},
+		{"RESP2 with base64", "/", "resp2", "base64", invalidResponseEncodingMessage},
+		{"multi-exec with RESP2 and base64", "/multi-exec", "resp2", "base64", invalidResponseEncodingMessage},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`["PING"]`))
+			request.Header.Set("Authorization", "Bearer test-token")
+			request.Header.Set(responseFormatHeader, test.format)
+
+			if test.encoding != "" {
+				request.Header.Set(responseEncodingHeader, test.encoding)
+			}
+
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			wantBody := `{"error":"` + test.wantError + `"}`
+
+			if response.Code != http.StatusBadRequest || strings.TrimSpace(response.Body.String()) != wantBody {
+				t.Fatalf("got %d %q, want 400 %q", response.Code, response.Body.String(), wantBody)
+			}
+
+			if response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("got content type %q, want application/json", response.Header().Get("Content-Type"))
+			}
+		})
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer test-token")
+	request.Header.Set(responseFormatHeader, "xml")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusMethodNotAllowed || strings.TrimSpace(response.Body.String()) != `{"error":"Method Not Allowed"}` {
+		t.Fatalf("got %d %q, want a method error before response format validation", response.Code, response.Body.String())
+	}
+
+	if response.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("got Allow %q, want POST", response.Header().Get("Allow"))
+	}
+
+	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
+		t.Fatalf("invalid response options created a Redis pool: %+v", stats)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/multi-exec", strings.NewReader(`[]`))
+	request.Header.Set("Authorization", "Bearer test-token")
+	request.Header.Set(responseFormatHeader, "RESP2")
+	response = httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || strings.TrimSpace(response.Body.String()) != `{"error":"Invalid transaction"}` {
+		t.Fatalf("got %d %q, want a JSON transaction error", response.Code, response.Body.String())
+	}
+
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("got content type %q, want application/json", response.Header().Get("Content-Type"))
+	}
+}
+
+func TestRESP2InfrastructureErrorsUseJSON(t *testing.T) {
+	handler, _ := newTestServer(t, []redisproxy.Backend{{
+		Token:            "test-token",
+		ID:               "test",
+		ConnectionString: "redis://127.0.0.1:1",
+		MaxConnections:   3,
+	}}, io.Discard)
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"command", http.MethodGet, "/ping", ""},
+		{"pipeline", http.MethodPost, "/pipeline", `[["PING"]]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			request.Header.Set("Authorization", "Bearer test-token")
+			request.Header.Set(responseFormatHeader, "resp2")
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadGateway || strings.TrimSpace(response.Body.String()) != `{"error":"Redis unavailable"}` {
+				t.Fatalf("got %d %q, want JSON Redis unavailable response", response.Code, response.Body.String())
+			}
+
+			if response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("got content type %q, want application/json", response.Header().Get("Content-Type"))
+			}
+		})
+	}
+}
+
+func TestResponseUsesRESP2(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		format   string
+		encoding string
+		want     bool
+		wantErr  error
+	}{
+		{"default", "", "", false, nil},
+		{"JSON", "JSON", "", false, nil},
+		{"RESP2", "RESP2", "", true, nil},
+		{"invalid", "other", "", false, errInvalidResponseFormat},
+		{"RESP2 with base64", "resp2", "BASE64", false, errInvalidResponseEncoding},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/ping", nil)
+			request.Header.Set(responseFormatHeader, test.format)
+			request.Header.Set(responseEncodingHeader, test.encoding)
+
+			got, err := responseUsesRESP2(request)
+
+			if got != test.want || !errors.Is(err, test.wantErr) {
+				t.Fatalf("got (%v, %v), want (%v, %v)", got, err, test.want, test.wantErr)
+			}
+		})
 	}
 }
 

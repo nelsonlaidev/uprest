@@ -100,6 +100,130 @@ func TestPipelineWithRedis(t *testing.T) {
 	}
 }
 
+func TestRESP2WithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+	key := fmt.Sprintf("uprest:resp2:%d", time.Now().UnixNano())
+	counterKey := key + ":counter"
+	listKey := key + ":list"
+	binaryKey := key + ":binary"
+	binaryValue := []byte{0x00, 0xff, 'a', '/', '\n'}
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		defer cancel()
+
+		if err := client.Del(ctx, key, counterKey, listKey, binaryKey).Err(); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	defer cancel()
+
+	if err := client.Set(ctx, binaryKey, binaryValue, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := redisIntegrationHandler(t)
+	serve := func(path string, command any, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+
+		body, err := json.Marshal(command)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		request.Header.Set("Authorization", "Bearer test-token")
+
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+
+		response := httptest.NewRecorder()
+
+		handler.ServeHTTP(response, request)
+
+		return response
+	}
+	resp2Headers := map[string]string{responseFormatHeader: "resp2"}
+
+	response := serve("/", []any{"PING"}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/octet-stream" || response.Body.String() != "+PONG\r\n" {
+		t.Fatalf("unexpected RESP2 PING response: %d %q %q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+
+	response = serve("/", []any{"SET", key, "hello"}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Body.String() != "+OK\r\n" {
+		t.Fatalf("unexpected RESP2 SET response: %d %q", response.Code, response.Body.String())
+	}
+
+	response = serve("/", []any{"GET", key}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Body.String() != "$5\r\nhello\r\n" {
+		t.Fatalf("unexpected RESP2 GET response: %d %q", response.Code, response.Body.String())
+	}
+
+	response = serve("/", []any{"GET", key + ":missing"}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Body.String() != "$-1\r\n" {
+		t.Fatalf("unexpected RESP2 nil response: %d %q", response.Code, response.Body.String())
+	}
+
+	response = serve("/", []any{"INCR", counterKey}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Body.String() != ":1\r\n" {
+		t.Fatalf("unexpected RESP2 integer response: %d %q", response.Code, response.Body.String())
+	}
+
+	response = serve("/", []any{"RPUSH", listKey, "a", "b"}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Body.String() != ":2\r\n" {
+		t.Fatalf("unexpected RESP2 RPUSH response: %d %q", response.Code, response.Body.String())
+	}
+
+	response = serve("/", []any{"LRANGE", listKey, 0, -1}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Body.String() != "*2\r\n$1\r\na\r\n$1\r\nb\r\n" {
+		t.Fatalf("unexpected RESP2 array response: %d %q", response.Code, response.Body.String())
+	}
+
+	response = serve("/", []any{"INCR", key}, resp2Headers)
+
+	if response.Code != http.StatusBadRequest || response.Header().Get("Content-Type") != "application/octet-stream" || !strings.HasPrefix(response.Body.String(), "-ERR ") {
+		t.Fatalf("unexpected RESP2 error response: %d %q %q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+
+	response = serve("/pipeline", []any{
+		[]any{"PING"},
+		[]any{"GET", key},
+		[]any{"GET", binaryKey},
+		[]any{"GET", key + ":missing"},
+		[]any{"EVAL", "return {1, 2, {3, 'hello'}}", 0},
+		[]any{"INCR", key},
+	}, resp2Headers)
+	wantPipelinePrefix := []byte("+PONG\r\n$5\r\nhello\r\n")
+	wantPipelinePrefix = fmt.Appendf(wantPipelinePrefix, "$%d\r\n", len(binaryValue))
+	wantPipelinePrefix = append(wantPipelinePrefix, binaryValue...)
+	wantPipelinePrefix = append(wantPipelinePrefix, []byte("\r\n$-1\r\n*3\r\n:1\r\n:2\r\n*2\r\n:3\r\n$5\r\nhello\r\n-ERR ")...)
+
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/octet-stream" || !bytes.HasPrefix(response.Body.Bytes(), wantPipelinePrefix) {
+		t.Fatalf("unexpected RESP2 pipeline response: %d %q %q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+
+	response = serve("/multi-exec", []any{
+		[]any{"GET", key},
+	}, resp2Headers)
+
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" || strings.TrimSpace(response.Body.String()) != `[{"result":"hello"}]` {
+		t.Fatalf("unexpected multi-exec response: %d %q %q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+}
+
 func TestScriptNormalizationWithRedis(t *testing.T) {
 	client := redisIntegrationClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -244,13 +368,25 @@ func TestPathCommandsWithRedis(t *testing.T) {
 	}
 
 	response = servePathCommand(t, handler, http.MethodGet, "/get/"+url.PathEscape(key), nil, map[string]string{
-		"Upstash-Encoding": "base64",
+		responseEncodingHeader: "base64",
+		responseFormatHeader:   "json",
 	})
 
 	wantPayload := base64.StdEncoding.EncodeToString(payload)
 
 	if response.Code != http.StatusOK || strings.TrimSpace(response.Body.String()) != fmt.Sprintf(`{"result":%q}`, wantPayload) {
 		t.Fatalf("got %d %q, want base64 binary GET result", response.Code, response.Body.String())
+	}
+
+	response = servePathCommand(t, handler, http.MethodGet, "/get/"+url.PathEscape(key), nil, map[string]string{
+		responseFormatHeader: "resp2",
+	})
+	wantRESP2Payload := fmt.Appendf(nil, "$%d\r\n", len(payload))
+	wantRESP2Payload = append(wantRESP2Payload, payload...)
+	wantRESP2Payload = append(wantRESP2Payload, '\r', '\n')
+
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/octet-stream" || !bytes.Equal(response.Body.Bytes(), wantRESP2Payload) {
+		t.Fatalf("got %d %q %q, want binary RESP2 payload %q", response.Code, response.Header().Get("Content-Type"), response.Body.Bytes(), wantRESP2Payload)
 	}
 
 	request := httptest.NewRequest(http.MethodPost, "/set/"+url.PathEscape(queryKey)+"?PX=60000&_token=test-token", bytes.NewReader([]byte("query-value")))
