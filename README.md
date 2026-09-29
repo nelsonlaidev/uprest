@@ -75,7 +75,7 @@ docker run --rm -d -p 8079:8080 --name uprest \
   ghcr.io/nelsonlaidev/uprest:latest
 ```
 
-The image listens on port `8080`. These examples use the `latest` tag, which tracks the newest stable release; pin a version tag such as `ghcr.io/nelsonlaidev/uprest:v0.2.0` for reproducible environments. On macOS and Windows, Docker Desktop can reach Redis on the host at `redis://host.docker.internal:6379`. Use a private token and an appropriate Redis URL outside local development.
+The image listens on port `8080`. These examples use the `latest` tag, which tracks the newest stable release; pin a version tag such as `ghcr.io/nelsonlaidev/uprest:v0.3.0` for reproducible environments. On macOS and Windows, Docker Desktop can reach Redis on the host at `redis://host.docker.internal:6379`. Use a private token and an appropriate Redis URL outside local development.
 
 ## Configuration
 
@@ -206,7 +206,7 @@ jobs:
       redis:
         image: redis:8.10.2
       uprest:
-        image: ghcr.io/nelsonlaidev/uprest:v0.2.0
+        image: ghcr.io/nelsonlaidev/uprest:v0.3.0
         env:
           UPREST_TOKEN: example-token
           UPREST_CONNECTION_STRING: redis://redis:6379
@@ -227,8 +227,8 @@ Linux, macOS, and Windows archives are available on the [GitHub Releases page](h
 Multi-architecture Linux images are published to both registries:
 
 ```sh
-docker pull ghcr.io/nelsonlaidev/uprest:v0.2.0
-docker pull nelsonlaidev/uprest:v0.2.0
+docker pull ghcr.io/nelsonlaidev/uprest:v0.3.0
+docker pull nelsonlaidev/uprest:v0.3.0
 ```
 
 Stable releases also use the `latest` tag. See [`CHANGELOG.md`](CHANGELOG.md) for release history.
