@@ -24,8 +24,10 @@ import (
 
 const maxBodySize = 10 << 20
 const commandTimeout = 30 * time.Second
-const subscriptionHeartbeatInterval = 15 * time.Second
-const subscriptionWriteTimeout = 5 * time.Second
+const streamHeartbeatInterval = 15 * time.Second
+const streamWriteTimeout = 5 * time.Second
+const monitorStopTimeout = 5 * time.Second
+const monitorEventBufferSize = 100
 const syncTokenHeader = "Upstash-Sync-Token" //nolint:gosec // G101: HTTP header name, not a credential
 const responseFormatHeader = "Upstash-Response-Format"
 const responseEncodingHeader = "Upstash-Encoding"
@@ -33,13 +35,15 @@ const invalidResponseFormatMessage = "Invalid response format"
 const invalidResponseEncodingMessage = "Invalid response encoding"
 const invalidSubscriptionMessage = "Invalid subscription"
 const redisUnavailableMessage = "Redis unavailable"
-const subscriptionHeartbeat = ": keepalive\n\n"
+const streamHeartbeat = ": keepalive\n\n"
 
 var requestSequence atomic.Uint64
 var errInvalidResponseFormat = errors.New(invalidResponseFormatMessage)     //nolint:staticcheck // ST1005: external HTTP API message.
 var errInvalidResponseEncoding = errors.New(invalidResponseEncodingMessage) //nolint:staticcheck // ST1005: external HTTP API message.
 var errInvalidSubscription = errors.New(invalidSubscriptionMessage)         //nolint:staticcheck // ST1005: external HTTP API message.
 var errInvalidSubscriptionEvent = errors.New("subscription event contains a line break")
+var errInvalidMonitorEvent = errors.New("monitor event contains a line break")
+var errInvalidMonitorConfirmation = errors.New("invalid monitor confirmation")
 
 type requestIDContextKey struct{}
 
@@ -107,12 +111,19 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set(syncTokenHeader, newRequestID())
 
+	monitor := monitorRoute(r.URL.Path)
 	patternSubscription, subscription := subscriptionRoute(r.URL.Path)
 	var subscriptionNames []string
 	var resp2Response bool
 	var err error
 
-	if subscription {
+	if monitor {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+			return
+		}
+	} else if subscription {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
@@ -145,7 +156,17 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	client, release, err := h.pools.Acquire(token)
+	acquireCtx, cancelAcquire := context.WithTimeout(r.Context(), commandTimeout)
+	var client *redis.Client
+	var release func()
+
+	if monitor {
+		client, release, err = h.pools.AcquireDedicated(acquireCtx, token)
+	} else {
+		client, release, err = h.pools.Acquire(acquireCtx, token)
+	}
+
+	cancelAcquire()
 
 	if errors.Is(err, redisproxy.ErrUnauthorized) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
@@ -153,7 +174,16 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			return
+		}
+
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Service Unavailable"})
+		return
+	}
+
+	if monitor {
+		h.serveMonitor(w, r, client, release)
 		return
 	}
 
@@ -180,6 +210,141 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Allow", allowedMethods(r.URL.Path))
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+	}
+}
+
+func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client *redis.Client, release func()) {
+	events := make(chan string, monitorEventBufferSize)
+	// MonitorCmd starts a background reader after its initial Process call returns.
+	// A sticky Conn keeps that socket out of the ordinary pool while the reader owns it.
+	connection := client.Conn()
+	monitor := connection.Monitor(r.Context(), events)
+
+	if err := monitor.Err(); err != nil {
+		_ = connection.Close()
+		release()
+
+		if r.Context().Err() == nil {
+			response, status := commandResponse(nil, err, false)
+			writeJSON(w, status, response)
+		}
+
+		return
+	}
+
+	monitor.Start()
+
+	defer stopMonitor(release, monitor, events)
+
+	confirmationTimer := time.NewTimer(commandTimeout)
+
+	defer confirmationTimer.Stop()
+
+	var confirmation string
+
+	select {
+	case <-r.Context().Done():
+		return
+
+	case <-confirmationTimer.C:
+		if r.Context().Err() != nil {
+			return
+		}
+
+		h.logger.DebugContext(r.Context(), "Redis monitor confirmation timed out",
+			"request_id", r.Context().Value(requestIDContextKey{}),
+			"timeout", commandTimeout,
+		)
+		writeRedisUnavailable(w)
+		return
+
+	case confirmation = <-events:
+	}
+
+	firstEvent, err := formatMonitorEvent(confirmation, true)
+
+	if err != nil {
+		writeRedisUnavailable(w)
+		return
+	}
+
+	controller := http.NewResponseController(w)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	if err := writeSSE(w, controller, firstEvent); err != nil {
+		return
+	}
+
+	heartbeat := time.NewTimer(streamHeartbeatInterval)
+
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+
+		case event := <-events:
+			body, err := formatMonitorEvent(event, false)
+
+			if err != nil {
+				return
+			}
+
+			if err := writeSSE(w, controller, body); err != nil {
+				return
+			}
+
+			heartbeat.Reset(streamHeartbeatInterval)
+
+		case <-heartbeat.C:
+			if err := writeSSE(w, controller, []byte(streamHeartbeat)); err != nil {
+				return
+			}
+
+			heartbeat.Reset(streamHeartbeatInterval)
+		}
+	}
+}
+
+func stopMonitor(release func(), monitor *redis.MonitorCmd, events <-chan string) {
+	stopped := make(chan struct{})
+	timer := time.NewTimer(monitorStopTimeout)
+
+	defer timer.Stop()
+
+	// MonitorCmd.Stop waits for its background reader's mutex. Releasing the
+	// dedicated client interrupts an idle socket read, while draining events
+	// prevents the reader from blocking on a full channel during shutdown. The
+	// sticky Conn must not be returned to its parent pool while that reader may
+	// still be active; closing the parent client already closes its socket.
+	go func() {
+		monitor.Stop()
+		close(stopped)
+	}()
+
+	release()
+
+	for {
+		select {
+		case <-events:
+
+		case <-stopped:
+			for {
+				select {
+				case <-events:
+
+				default:
+					return
+				}
+			}
+
+		case <-timer.C:
+			return
+		}
 	}
 }
 
@@ -224,7 +389,7 @@ func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, c
 	}
 
 	events := pubsub.ChannelWithSubscriptions()
-	heartbeat := time.NewTimer(subscriptionHeartbeatInterval)
+	heartbeat := time.NewTimer(streamHeartbeatInterval)
 
 	defer heartbeat.Stop()
 
@@ -252,14 +417,14 @@ func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, c
 				return
 			}
 
-			heartbeat.Reset(subscriptionHeartbeatInterval)
+			heartbeat.Reset(streamHeartbeatInterval)
 
 		case <-heartbeat.C:
-			if err := writeSSE(w, controller, []byte(subscriptionHeartbeat)); err != nil {
+			if err := writeSSE(w, controller, []byte(streamHeartbeat)); err != nil {
 				return
 			}
 
-			heartbeat.Reset(subscriptionHeartbeatInterval)
+			heartbeat.Reset(streamHeartbeatInterval)
 		}
 	}
 }
@@ -488,6 +653,10 @@ func reservedPath(path string) bool {
 	return path == "/" || path == "/pipeline" || path == "/multi-exec"
 }
 
+func monitorRoute(path string) bool {
+	return strings.EqualFold(path, "/monitor")
+}
+
 func subscriptionRoute(path string) (pattern bool, ok bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	segment, _, _ := strings.Cut(trimmed, "/")
@@ -608,10 +777,26 @@ func formatSubscriptionEvent(event any) ([]byte, error) {
 	}
 }
 
+func formatMonitorEvent(event string, confirmation bool) ([]byte, error) {
+	if containsSSELineBreak(event) {
+		return nil, errInvalidMonitorEvent
+	}
+
+	if confirmation {
+		if event != "OK" {
+			return nil, errInvalidMonitorConfirmation
+		}
+
+		return []byte("data: \"OK\"\n\n"), nil
+	}
+
+	return fmt.Appendf(nil, "data: %s\n\n", event), nil
+}
+
 func writeSSE(w http.ResponseWriter, controller *http.ResponseController, body []byte) error {
 	deadlineSupported := true
 
-	if err := controller.SetWriteDeadline(time.Now().Add(subscriptionWriteTimeout)); err != nil {
+	if err := controller.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil {
 		if !errors.Is(err, http.ErrNotSupported) {
 			return err
 		}

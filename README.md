@@ -118,6 +118,7 @@ Each token selects its configured Redis backend. `max_connections` is optional a
 | `/`                        | `POST` | JSON command array                                  |
 | `/pipeline`                | `POST` | JSON array of commands                              |
 | `/multi-exec`              | `POST` | JSON array of commands run in Redis `MULTI`/`EXEC`  |
+| `/monitor`                 | `POST` | Redis `MONITOR` output as an SSE stream             |
 | `/subscribe/<channel...>`  | `POST` | One or more URL-encoded Pub/Sub channels            |
 | `/psubscribe/<pattern...>` | `POST` | One or more URL-encoded Pub/Sub patterns            |
 | `/<command>/<args...>`     | `GET`  | URL-encoded arguments                               |
@@ -155,7 +156,21 @@ await subscriber.unsubscribe()
 
 An idle stream receives an SSE heartbeat every 15 seconds. Closing or aborting the request unsubscribes it. Each stream holds one Redis connection and counts toward `UPREST_MAX_CONNECTIONS` or the backend's `max_connections` limit.
 
-Channel and pattern names containing CR or LF are rejected. Commas are unsupported by the SDK parser, and a message payload containing CR or LF ends the stream. `MONITOR` is not supported.
+Channel and pattern names containing CR or LF are rejected. Commas are unsupported by the SDK parser, and a message payload containing CR or LF ends the stream.
+
+### Monitor
+
+Open an authenticated Redis `MONITOR` stream with `POST /monitor`:
+
+```sh
+curl -N -X POST \
+  -H 'Authorization: Bearer example-token' \
+  http://localhost:8079/monitor
+```
+
+The response is an SSE stream. Its first event is `data: "OK"`; subsequent events contain Redis's raw `MONITOR` lines, and idle streams receive a heartbeat every 15 seconds. Closing or aborting the request stops monitoring and releases its connection.
+
+Each monitor uses a dedicated Redis connection and shares the backend's `UPREST_MAX_CONNECTIONS` or `max_connections` limit with commands and Pub/Sub streams. Redis warns that `MONITOR` can reduce throughput significantly, so use it temporarily for diagnostics and ensure the configured Redis user is allowed to run the command. Response-format and base64 headers do not change the stream.
 
 ### Rate limiting
 
@@ -163,7 +178,7 @@ uprest works with `@upstash/ratelimit`, including versions 2.1.0 and later. It r
 
 ### Known differences
 
-Upstash Search and Vector commands, `MONITOR` streaming, some RedisJSON response details, and selected Upstash-specific command behavior are not supported. The compatibility exclusions are documented in [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt).
+Upstash Search and Vector commands, some RedisJSON response details, and selected Upstash-specific command behavior are not supported. The compatibility exclusions are documented in [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt).
 
 uprest returns an opaque `Upstash-Sync-Token`, but it does not coordinate replicas with an incoming token because each authentication token routes to one Redis backend.
 
@@ -171,7 +186,7 @@ uprest returns an opaque `Upstash-Sync-Token`, but it does not coordinate replic
 
 Request, pool lifecycle, and shutdown events use structured JSON logs without bearer tokens or Redis connection strings. Set `UPREST_LOG_LEVEL=debug` to include script-normalization events.
 
-The server uses a 5-second header-read timeout, 15-second read timeout, 50-second write timeout, and 60-second keep-alive timeout. Redis commands and initial Pub/Sub confirmation have a 30-second deadline. On shutdown, active request contexts are cancelled before the server waits up to 10 seconds for handlers to exit.
+The server uses a 5-second header-read timeout, 15-second read timeout, 50-second write timeout, and 60-second keep-alive timeout. Redis commands, backend connection acquisition, and initial Pub/Sub or `MONITOR` confirmation have a 30-second deadline. When a backend reaches its connection limit, a request waits for capacity until that deadline and then returns `503`. On shutdown, active request contexts are cancelled before the server waits up to 10 seconds for handlers to exit.
 
 ## Deployment
 

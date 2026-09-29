@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -482,7 +483,7 @@ func TestSubscribeWithRedis(t *testing.T) {
 	firstChannel := prefix + ":first"
 	secondChannel := prefix + ":second"
 	path := "/subscribe/" + url.PathEscape(firstChannel) + "/" + url.PathEscape(secondChannel)
-	response, reader, _ := openSubscription(t, httpServer.URL, path, map[string]string{ //nolint:bodyclose // openSubscription registers response cleanup.
+	response, reader, _ := openSSEStream(t, httpServer.URL, path, map[string]string{ //nolint:bodyclose // openSSEStream registers response cleanup.
 		responseEncodingHeader: "base64",
 		responseFormatHeader:   "resp2",
 	})
@@ -534,7 +535,7 @@ func TestSubscribeWithRedis(t *testing.T) {
 		}
 	}
 
-	secondResponse, secondReader, _ := openSubscription(t, httpServer.URL, "/subscribe/"+url.PathEscape(firstChannel), nil) //nolint:bodyclose // openSubscription registers response cleanup.
+	secondResponse, secondReader, _ := openSSEStream(t, httpServer.URL, "/subscribe/"+url.PathEscape(firstChannel), nil) //nolint:bodyclose // openSSEStream registers response cleanup.
 
 	if got := readSSEEvent(t, secondReader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", firstChannel) {
 		t.Fatalf("got second subscriber confirmation %q", got)
@@ -571,7 +572,7 @@ func TestPSubscribeWithRedis(t *testing.T) {
 	prefix := fmt.Sprintf("uprest:psubscribe:%d", time.Now().UnixNano())
 	pattern := prefix + ":*"
 	channel := prefix + ":one"
-	_, reader, _ := openSubscription(t, httpServer.URL, "/psubscribe/"+url.PathEscape(pattern), nil) //nolint:bodyclose // openSubscription registers response cleanup.
+	_, reader, _ := openSSEStream(t, httpServer.URL, "/psubscribe/"+url.PathEscape(pattern), nil) //nolint:bodyclose // openSSEStream registers response cleanup.
 
 	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: psubscribe,%s,1\n\n", pattern) {
 		t.Fatalf("got pattern confirmation %q", got)
@@ -599,7 +600,7 @@ func TestSubscriptionHeartbeatWithRedis(t *testing.T) {
 	t.Cleanup(httpServer.Close)
 
 	channel := fmt.Sprintf("uprest:heartbeat:%d", time.Now().UnixNano())
-	_, reader, _ := openSubscription(t, httpServer.URL, "/subscribe/"+url.PathEscape(channel), nil) //nolint:bodyclose // openSubscription registers response cleanup.
+	_, reader, _ := openSSEStream(t, httpServer.URL, "/subscribe/"+url.PathEscape(channel), nil) //nolint:bodyclose // openSSEStream registers response cleanup.
 
 	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", channel) {
 		t.Fatalf("got confirmation %q", got)
@@ -607,8 +608,8 @@ func TestSubscriptionHeartbeatWithRedis(t *testing.T) {
 
 	started := time.Now()
 
-	if got := readSSEEvent(t, reader, 16*time.Second); got != subscriptionHeartbeat {
-		t.Fatalf("got heartbeat %q, want %q", got, subscriptionHeartbeat)
+	if got := readSSEEvent(t, reader, 16*time.Second); got != streamHeartbeat {
+		t.Fatalf("got heartbeat %q, want %q", got, streamHeartbeat)
 	}
 
 	if elapsed := time.Since(started); elapsed > 16*time.Second {
@@ -629,7 +630,7 @@ func TestSubscriptionCancellationReleasesLeaseWithRedis(t *testing.T) {
 	t.Cleanup(httpServer.Close)
 
 	channel := fmt.Sprintf("uprest:cancel:%d", time.Now().UnixNano())
-	response, reader, cancel := openSubscription(t, httpServer.URL, "/subscribe/"+url.PathEscape(channel), nil)
+	response, reader, cancel := openSSEStream(t, httpServer.URL, "/subscribe/"+url.PathEscape(channel), nil)
 
 	if got := readSSEEvent(t, reader, 5*time.Second); got != fmt.Sprintf("data: subscribe,%s,1\n\n", channel) {
 		t.Fatalf("got confirmation %q", got)
@@ -677,6 +678,107 @@ func TestSubscriptionCancellationReleasesLeaseWithRedis(t *testing.T) {
 	}
 }
 
+func TestMonitorWithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
+		Token:            "test-token",
+		ID:               "integration",
+		ConnectionString: redisIntegrationURL(t),
+		MaxConnections:   1,
+	}}, io.Discard)
+	httpServer := httptest.NewServer(handler)
+
+	t.Cleanup(httpServer.Close)
+
+	baselineMonitors := monitorConnectionCount(t, client)
+	response, reader, cancel := openSSEStream(t, httpServer.URL, "/MONITOR?_token=test-token", map[string]string{
+		"Accept":               "text/event-stream",
+		responseEncodingHeader: "base64",
+		responseFormatHeader:   "resp2",
+	})
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", response.StatusCode)
+	}
+
+	if response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("got content type %q, want text/event-stream", response.Header.Get("Content-Type"))
+	}
+
+	if response.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatalf("got cache control %q, want no-cache", response.Header.Get("Cache-Control"))
+	}
+
+	if got := readSSEEvent(t, reader, 5*time.Second); got != "data: \"OK\"\n\n" {
+		t.Fatalf("got monitor confirmation %q", got)
+	}
+
+	waitForMonitorConnectionCount(t, client, baselineMonitors+1)
+
+	ctx, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, _, err := manager.Acquire(ctx, "test-token")
+	stop()
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ordinary acquisition returned %v while monitor held the only slot", err)
+	}
+
+	key := fmt.Sprintf("uprest:monitor:%d", time.Now().UnixNano())
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		defer cancel()
+
+		if err := client.Del(ctx, key).Err(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	ctx, stop = context.WithTimeout(context.Background(), 5*time.Second)
+	err = client.Set(ctx, key, "value", time.Minute).Err()
+	stop()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	matched := false
+
+	for range 10 {
+		event := readSSEEvent(t, reader, 5*time.Second)
+
+		if strings.Contains(strings.ToLower(event), `"set"`) && strings.Contains(event, key) {
+			matched = true
+			break
+		}
+	}
+
+	if !matched {
+		t.Fatalf("monitor stream did not include SET for %q", key)
+	}
+
+	cancel()
+	_ = response.Body.Close()
+	waitForMonitorConnectionCount(t, client, baselineMonitors)
+
+	ctx, stop = context.WithTimeout(context.Background(), time.Second)
+	_, release, err := manager.Acquire(ctx, "test-token")
+	stop()
+
+	if err != nil {
+		t.Fatalf("ordinary acquisition failed after monitor cancellation: %v", err)
+	}
+
+	release()
+
+	result := serveCommand(t, handler, "/", []any{"PING"})
+
+	if result.Code != http.StatusOK || strings.TrimSpace(result.Body.String()) != `{"result":"PONG"}` {
+		t.Fatalf("got %d %q after monitor cancellation", result.Code, result.Body.String())
+	}
+}
+
 func redisIntegrationClient(t *testing.T) *redis.Client {
 	t.Helper()
 
@@ -697,6 +799,48 @@ func redisIntegrationClient(t *testing.T) *redis.Client {
 	})
 
 	return client
+}
+
+func monitorConnectionCount(t *testing.T, client *redis.Client) int {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+
+	defer cancel()
+
+	clients, err := client.ClientList(ctx).Result()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+
+	for line := range strings.SplitSeq(clients, "\n") {
+		if strings.Contains(line, "cmd=monitor") {
+			count++
+		}
+	}
+
+	return count
+}
+
+func waitForMonitorConnectionCount(t *testing.T, client *redis.Client, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		if got := monitorConnectionCount(t, client); got == want {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("got %d monitor connections, want %d", monitorConnectionCount(t, client), want)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func redisIntegrationHandler(t *testing.T) http.Handler {
@@ -772,7 +916,7 @@ func servePathCommand(t *testing.T, handler http.Handler, method string, path st
 	return response
 }
 
-func openSubscription(t *testing.T, serverURL string, path string, headers map[string]string) (*http.Response, *bufio.Reader, context.CancelFunc) {
+func openSSEStream(t *testing.T, serverURL string, path string, headers map[string]string) (*http.Response, *bufio.Reader, context.CancelFunc) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())

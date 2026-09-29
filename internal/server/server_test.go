@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -75,7 +76,7 @@ func TestHandlerRejectsUnauthorizedAndMalformedRequests(t *testing.T) {
 		{"root method not allowed", http.MethodGet, "/", "Bearer test-token", "", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`},
 		{"root method without token", http.MethodGet, "/", "", "", http.StatusUnauthorized, `{"error":"Unauthorized"}`},
 		{"subscription method not allowed", http.MethodGet, "/subscribe/channel", "Bearer test-token", "", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`},
-		{"unsupported monitor endpoint", http.MethodPost, "/monitor", "Bearer test-token", "", http.StatusNotFound, `{"error":"Not Found"}`},
+		{"monitor without token", http.MethodPost, "/monitor", "", "", http.StatusUnauthorized, `{"error":"Unauthorized"}`},
 		{"subscription without token", http.MethodPost, "/subscribe/channel", "", "", http.StatusUnauthorized, `{"error":"Unauthorized"}`},
 	}
 
@@ -159,8 +160,8 @@ func TestQueryTokenAuthentication(t *testing.T) {
 
 	handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("path request returned %d %q, want 404", response.Code, response.Body.String())
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("path request returned %d %q, want 405", response.Code, response.Body.String())
 	}
 }
 
@@ -203,7 +204,7 @@ func TestQueryTokenNotLogged(t *testing.T) {
 		token  string
 		status int
 	}{
-		{"valid", "test-token", http.StatusNotFound},
+		{"valid", "test-token", http.StatusMethodNotAllowed},
 		{"invalid", "query-secret", http.StatusUnauthorized},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -230,7 +231,7 @@ func TestQueryTokenNotLogged(t *testing.T) {
 	}
 }
 
-func TestUnsupportedMonitorDoesNotCreatePool(t *testing.T) {
+func TestMonitorRequestValidationDoesNotCreatePool(t *testing.T) {
 	handler, manager := newTestServer(t, []redisproxy.Backend{{
 		Token:            "test-token",
 		ID:               "test",
@@ -238,18 +239,65 @@ func TestUnsupportedMonitorDoesNotCreatePool(t *testing.T) {
 		MaxConnections:   3,
 	}}, io.Discard)
 
-	request := httptest.NewRequest(http.MethodGet, "/monitor", nil)
-	request.Header.Set("Authorization", "Bearer test-token")
-	response := httptest.NewRecorder()
+	for _, test := range []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantAllow  string
+	}{
+		{"monitor requires POST", http.MethodGet, "/monitor", http.StatusMethodNotAllowed, http.MethodPost},
+		{"monitor rejects PUT", http.MethodPut, "/MONITOR", http.StatusMethodNotAllowed, http.MethodPost},
+		{"monitor rejects trailing slash", http.MethodPost, "/monitor/", http.StatusNotFound, ""},
+		{"monitor rejects arguments", http.MethodPost, "/monitor/extra", http.StatusNotFound, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("Authorization", "Bearer test-token")
+			response := httptest.NewRecorder()
 
-	handler.ServeHTTP(response, request)
+			handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("monitor returned %d, want 404", response.Code)
+			if response.Code != test.wantStatus {
+				t.Fatalf("monitor returned %d, want %d", response.Code, test.wantStatus)
+			}
+
+			if response.Header().Get("Allow") != test.wantAllow {
+				t.Fatalf("got Allow %q, want %q", response.Header().Get("Allow"), test.wantAllow)
+			}
+		})
 	}
 
 	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
-		t.Fatalf("unsupported monitor created a Redis pool: %+v", stats)
+		t.Fatalf("invalid monitor request created a Redis pool: %+v", stats)
+	}
+}
+
+func TestMonitorCancellationBeforeStartDoesNotWriteError(t *testing.T) {
+	client := redis.NewClient(&redis.Options{
+		Addr:     "127.0.0.1:1",
+		Protocol: 2,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/monitor", nil)
+	ctx, cancel := context.WithCancel(request.Context())
+	request = request.WithContext(ctx)
+	cancel()
+
+	response := httptest.NewRecorder()
+	released := false
+	handler := &apiHandler{}
+
+	handler.serveMonitor(response, request, client, func() {
+		released = true
+		_ = client.Close()
+	})
+
+	if !released {
+		t.Fatal("canceled monitor did not release its dedicated client")
+	}
+
+	if response.Body.Len() != 0 || response.Header().Get("Content-Type") != "" {
+		t.Fatalf("canceled monitor wrote a response: headers=%v body=%q", response.Header(), response.Body.String())
 	}
 }
 
@@ -355,6 +403,30 @@ func TestFormatSubscriptionEvent(t *testing.T) {
 	}
 }
 
+func TestFormatMonitorEvent(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		event        string
+		confirmation bool
+		want         string
+		wantErr      error
+	}{
+		{"confirmation", "OK", true, "data: \"OK\"\n\n", nil},
+		{"command", `1721284008.663811 [0 127.0.0.1:6379] "SET" "key" "value"`, false, "data: 1721284008.663811 [0 127.0.0.1:6379] \"SET\" \"key\" \"value\"\n\n", nil},
+		{"invalid confirmation", "PONG", true, "", errInvalidMonitorConfirmation},
+		{"event with LF", "first\nsecond", false, "", errInvalidMonitorEvent},
+		{"event with CR", "first\rsecond", false, "", errInvalidMonitorEvent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := formatMonitorEvent(test.event, test.confirmation)
+
+			if string(got) != test.want || !errors.Is(err, test.wantErr) {
+				t.Fatalf("got (%q, %v), want (%q, %v)", got, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestWriteSSEUsesBoundedWriteDeadline(t *testing.T) {
 	writer := &sseDeadlineWriter{header: make(http.Header)}
 	controller := http.NewResponseController(writer)
@@ -372,8 +444,8 @@ func TestWriteSSEUsesBoundedWriteDeadline(t *testing.T) {
 		t.Fatalf("got %d write deadlines, want bounded and cleared deadlines", len(writer.deadlines))
 	}
 
-	if writer.deadlines[0].Before(started) || writer.deadlines[0].After(started.Add(subscriptionWriteTimeout+time.Second)) {
-		t.Fatalf("got initial write deadline %s, want approximately %s", writer.deadlines[0], started.Add(subscriptionWriteTimeout))
+	if writer.deadlines[0].Before(started) || writer.deadlines[0].After(started.Add(streamWriteTimeout+time.Second)) {
+		t.Fatalf("got initial write deadline %s, want approximately %s", writer.deadlines[0], started.Add(streamWriteTimeout))
 	}
 
 	if !writer.deadlines[1].IsZero() {
@@ -496,7 +568,7 @@ func TestRESP2InfrastructureErrorsUseJSON(t *testing.T) {
 	}
 }
 
-func TestSubscriptionInfrastructureErrorsUseJSON(t *testing.T) {
+func TestStreamingInfrastructureErrorsUseJSON(t *testing.T) {
 	handler, _ := newTestServer(t, []redisproxy.Backend{{
 		Token:            "test-token",
 		ID:               "test",
@@ -511,6 +583,7 @@ func TestSubscriptionInfrastructureErrorsUseJSON(t *testing.T) {
 	}{
 		{"/subscribe/channel?_token=test-token", "xml", "base64"},
 		{"/psubscribe/channel:*?_token=test-token", "resp2", "base64"},
+		{"/monitor?_token=test-token", "xml", "base64"},
 	} {
 		request := httptest.NewRequest(http.MethodPost, test.path, nil)
 		request.Header.Set(responseFormatHeader, test.format)
