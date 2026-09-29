@@ -20,7 +20,7 @@ services:
   redis:
     image: redis:8.10.2
   uprest:
-    image: ghcr.io/nelsonlaidev/uprest:v0.2.0
+    image: ghcr.io/nelsonlaidev/uprest:latest
     ports:
       - '8079:8080'
     environment:
@@ -72,10 +72,10 @@ To connect uprest to an existing Redis server instead, run only the proxy:
 docker run --rm -d -p 8079:8080 --name uprest \
   -e UPREST_TOKEN=example-token \
   -e UPREST_CONNECTION_STRING=redis://your-redis-host:6379 \
-  ghcr.io/nelsonlaidev/uprest:v0.2.0
+  ghcr.io/nelsonlaidev/uprest:latest
 ```
 
-The image listens on port `8080`. On macOS and Windows, Docker Desktop can reach Redis on the host at `redis://host.docker.internal:6379`. Use a private token and an appropriate Redis URL outside local development.
+The image listens on port `8080`. These examples use the `latest` tag, which tracks the newest stable release; pin a version tag such as `ghcr.io/nelsonlaidev/uprest:v0.2.0` for reproducible environments. On macOS and Windows, Docker Desktop can reach Redis on the host at `redis://host.docker.internal:6379`. Use a private token and an appropriate Redis URL outside local development.
 
 ## Configuration
 
