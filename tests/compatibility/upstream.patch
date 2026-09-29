@@ -15,13 +15,6 @@ index 57552e3..d59ac25 100644
 @@ -50 +50 @@ describe("COPY test", () => {
 -  test("should handle same source and destination keys", async () => {
 +  test.skip("should handle same source and destination keys", async () => {
-diff --git a/packages/redis/pkg/commands/scan.test.ts b/packages/redis/pkg/commands/scan.test.ts
-index 55835b5..5474fc5 100644
---- a/packages/redis/pkg/commands/scan.test.ts
-+++ b/packages/redis/pkg/commands/scan.test.ts
-@@ -95 +95 @@ describe("with withType", () => {
--  test("returns cursor and keys with types", async () => {
-+  test.skip("returns cursor and keys with types", async () => {
 diff --git a/packages/redis/pkg/commands/xreadgroup.test.ts b/packages/redis/pkg/commands/xreadgroup.test.ts
 index df49a8c..e21c3a5 100644
 --- a/packages/redis/pkg/commands/xreadgroup.test.ts

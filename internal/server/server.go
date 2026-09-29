@@ -468,7 +468,7 @@ func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, clie
 
 	defer cancel()
 
-	h.normalizeCommand(r, command)
+	command = h.normalizeCommand(r, command)
 
 	if resp2Response {
 		response, err := client.DoRaw(ctx, command...).Result()
@@ -517,7 +517,7 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 		results := make([]*redis.RawCmd, len(commands))
 
 		for i, command := range commands {
-			h.normalizeCommand(r, command)
+			command = h.normalizeCommand(r, command)
 			results[i] = redis.NewRawCmd(ctx, command...)
 			_ = pipeline.Process(ctx, results[i]) // Pipeline.Process only queues commands and returns nil.
 		}
@@ -555,7 +555,7 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 	results := make([]*redis.Cmd, len(commands))
 
 	for i, command := range commands {
-		h.normalizeCommand(r, command)
+		command = h.normalizeCommand(r, command)
 		results[i] = pipeline.Do(ctx, command...)
 	}
 
@@ -590,9 +590,17 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (h *apiHandler) normalizeCommand(r *http.Request, command []any) {
+func (h *apiHandler) normalizeCommand(r *http.Request, command []any) []any {
+	if rewritten, changed := upstash.RewriteScanWithType(command); changed {
+		command = rewritten
+		h.logger.DebugContext(r.Context(), "Upstash SCAN WITHTYPE translated",
+			"request_id", r.Context().Value(requestIDContextKey{}),
+			"command", "SCAN",
+		)
+	}
+
 	if !h.normalizer.NormalizeCommand(command) {
-		return
+		return command
 	}
 
 	name, _ := command[0].(string)
@@ -606,6 +614,8 @@ func (h *apiHandler) normalizeCommand(r *http.Request, command []any) {
 		"request_id", r.Context().Value(requestIDContextKey{}),
 		"command", strings.ToUpper(name),
 	)
+
+	return command
 }
 
 func (w *statusWriter) WriteHeader(status int) {
