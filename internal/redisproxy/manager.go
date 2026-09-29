@@ -1,6 +1,7 @@
 package redisproxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ type backend struct {
 	key            poolKey
 	options        redis.Options
 	maxConnections int
+	slots          chan struct{}
 }
 
 type managedPool struct {
@@ -121,6 +123,7 @@ func NewManager(backends []Backend, idleTimeout time.Duration, logger *slog.Logg
 			},
 			options:        *options,
 			maxConnections: configured.MaxConnections,
+			slots:          make(chan struct{}, configured.MaxConnections),
 		}
 		manager.backends[tokenHash] = poolBackend
 	}
@@ -130,21 +133,14 @@ func NewManager(backends []Backend, idleTimeout time.Duration, logger *slog.Logg
 	return manager, nil
 }
 
-func (m *Manager) Acquire(token string) (*redis.Client, func(), error) {
-	tokenHash := sha256.Sum256([]byte(token))
-	poolBackend, authorized := m.backends[tokenHash]
+func (m *Manager) Acquire(ctx context.Context, token string) (*redis.Client, func(), error) {
+	poolBackend, releaseLease, err := m.acquireBackend(ctx, token)
 
-	if !authorized {
-		return nil, nil, ErrUnauthorized
+	if err != nil {
+		return nil, nil, err
 	}
 
 	m.mu.Lock()
-
-	if m.closed {
-		m.mu.Unlock()
-		return nil, nil, ErrClosed
-	}
-
 	pool := m.pools[poolBackend.key]
 
 	if pool == nil {
@@ -161,7 +157,6 @@ func (m *Manager) Acquire(token string) (*redis.Client, func(), error) {
 
 	pool.inUse++
 	pool.lastUsed = time.Now()
-	m.leases.Add(1)
 
 	client := pool.client
 	key := poolBackend.key
@@ -172,7 +167,39 @@ func (m *Manager) Acquire(token string) (*redis.Client, func(), error) {
 
 	release := func() {
 		once.Do(func() {
-			m.release(key, client)
+			m.releasePool(key, client)
+			releaseLease()
+		})
+	}
+
+	return client, release, nil
+}
+
+func (m *Manager) AcquireDedicated(ctx context.Context, token string) (*redis.Client, func(), error) {
+	poolBackend, releaseLease, err := m.acquireBackend(ctx, token)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	options := poolBackend.options
+	options.PoolSize = 1
+	options.MaxActiveConns = 1
+	options.MinIdleConns = 0
+	options.MaxIdleConns = 1
+	// Dedicated streaming connections remain valid while no Redis events arrive.
+	options.ReadTimeout = -1
+	client := redis.NewClient(&options)
+
+	var once sync.Once
+
+	release := func() {
+		once.Do(func() {
+			if err := client.Close(); err != nil && !errors.Is(err, redis.ErrClosed) {
+				m.logger.Warn("Dedicated Redis client close failed", "backend_id", poolBackend.id, "error", err)
+			}
+
+			releaseLease()
 		})
 	}
 
@@ -234,9 +261,47 @@ func (m *Manager) Close() error {
 	return errors.Join(closeErrors...)
 }
 
-func (m *Manager) release(key poolKey, client *redis.Client) {
-	defer m.leases.Done()
+func (m *Manager) acquireBackend(ctx context.Context, token string) (*backend, func(), error) {
+	tokenHash := sha256.Sum256([]byte(token))
+	poolBackend, authorized := m.backends[tokenHash]
 
+	if !authorized {
+		return nil, nil, ErrUnauthorized
+	}
+
+	select {
+	case poolBackend.slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-m.stop:
+		return nil, nil, ErrClosed
+	}
+
+	m.mu.Lock()
+
+	if m.closed {
+		m.mu.Unlock()
+		<-poolBackend.slots
+
+		return nil, nil, ErrClosed
+	}
+
+	m.leases.Add(1)
+	m.mu.Unlock()
+
+	var once sync.Once
+
+	release := func() {
+		once.Do(func() {
+			<-poolBackend.slots
+			m.leases.Done()
+		})
+	}
+
+	return poolBackend, release, nil
+}
+
+func (m *Manager) releasePool(key poolKey, client *redis.Client) {
 	m.mu.Lock()
 
 	defer m.mu.Unlock()

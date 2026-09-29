@@ -1,6 +1,7 @@
 package redisproxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -24,7 +25,7 @@ func TestManagerCreatesSeparateBoundedPools(t *testing.T) {
 		},
 	}, time.Minute)
 
-	first, releaseFirst, err := manager.Acquire("first-token")
+	first, releaseFirst, err := manager.Acquire(context.Background(), "first-token")
 
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +33,7 @@ func TestManagerCreatesSeparateBoundedPools(t *testing.T) {
 
 	defer releaseFirst()
 
-	firstAgain, releaseFirstAgain, err := manager.Acquire("first-token")
+	firstAgain, releaseFirstAgain, err := manager.Acquire(context.Background(), "first-token")
 
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +41,7 @@ func TestManagerCreatesSeparateBoundedPools(t *testing.T) {
 
 	defer releaseFirstAgain()
 
-	second, releaseSecond, err := manager.Acquire("second-token")
+	second, releaseSecond, err := manager.Acquire(context.Background(), "second-token")
 
 	if err != nil {
 		t.Fatal(err)
@@ -79,7 +80,7 @@ func TestManagerRejectsUnknownToken(t *testing.T) {
 		MaxConnections:   3,
 	}}, time.Minute)
 
-	_, _, err := manager.Acquire("wrong-token")
+	_, _, err := manager.Acquire(context.Background(), "wrong-token")
 
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("got %v, want ErrUnauthorized", err)
@@ -94,6 +95,125 @@ func TestManagerRejectsUnknownToken(t *testing.T) {
 	}
 }
 
+func TestManagerSharesCapacityWithDedicatedClients(t *testing.T) {
+	manager := newTestManager(t, []Backend{{
+		Token:            "test-token",
+		ID:               "test",
+		ConnectionString: "redis://localhost:6379",
+		MaxConnections:   1,
+	}}, time.Minute)
+
+	shared, releaseShared, err := manager.Acquire(context.Background(), "test-token")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_, _, err = manager.AcquireDedicated(ctx, "test-token")
+	cancel()
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context deadline exceeded", err)
+	}
+
+	releaseShared()
+
+	dedicated, releaseDedicated, err := manager.AcquireDedicated(context.Background(), "test-token")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if dedicated == shared {
+		t.Fatal("dedicated acquisition reused the shared Redis client")
+	}
+
+	if dedicated.Options().PoolSize != 1 || dedicated.Options().MaxActiveConns != 1 {
+		t.Fatalf("unexpected dedicated client limits: %+v", dedicated.Options())
+	}
+
+	// go-redis normalizes ReadTimeout=-1 to 0, meaning no socket read deadline.
+	if dedicated.Options().ReadTimeout != 0 {
+		t.Fatalf("got dedicated client read timeout %s, want disabled", dedicated.Options().ReadTimeout)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_, _, err = manager.Acquire(ctx, "test-token")
+	cancel()
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context deadline exceeded", err)
+	}
+
+	releaseDedicated()
+	releaseDedicated()
+
+	_, release, err := manager.Acquire(context.Background(), "test-token")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release()
+}
+
+func TestManagerCloseUnblocksCapacityWaiters(t *testing.T) {
+	manager := newTestManager(t, []Backend{{
+		Token:            "test-token",
+		ID:               "test",
+		ConnectionString: "redis://localhost:6379",
+		MaxConnections:   1,
+	}}, time.Minute)
+
+	_, release, err := manager.Acquire(context.Background(), "test-token")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waiting := make(chan error, 1)
+
+	go func() {
+		_, _, err := manager.Acquire(context.Background(), "test-token")
+		waiting <- err
+	}()
+
+	closed := make(chan error, 1)
+
+	go func() {
+		closed <- manager.Close()
+	}()
+
+	select {
+	case err := <-waiting:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("waiting acquisition returned %v, want ErrClosed", err)
+		}
+
+	case <-time.After(time.Second):
+		t.Fatal("manager close did not unblock a capacity waiter")
+	}
+
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before the active lease was released: %v", err)
+	default:
+	}
+
+	release()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the active lease was released")
+	}
+}
+
 func TestManagerEvictsAndRecreatesIdlePool(t *testing.T) {
 	manager := newTestManager(t, []Backend{{
 		Token:            "test-token",
@@ -102,7 +222,7 @@ func TestManagerEvictsAndRecreatesIdlePool(t *testing.T) {
 		MaxConnections:   3,
 	}}, 30*time.Millisecond)
 
-	first, release, err := manager.Acquire("test-token")
+	first, release, err := manager.Acquire(context.Background(), "test-token")
 
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +237,7 @@ func TestManagerEvictsAndRecreatesIdlePool(t *testing.T) {
 	release()
 	waitForPoolCount(t, manager, 0)
 
-	second, releaseSecond, err := manager.Acquire("test-token")
+	second, releaseSecond, err := manager.Acquire(context.Background(), "test-token")
 
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +292,7 @@ func TestManagerCloseWaitsForLeases(t *testing.T) {
 		MaxConnections:   3,
 	}}, time.Minute)
 
-	_, release, err := manager.Acquire("test-token")
+	_, release, err := manager.Acquire(context.Background(), "test-token")
 
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +309,7 @@ func TestManagerCloseWaitsForLeases(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 
 	for {
-		_, temporaryRelease, err := manager.Acquire("test-token")
+		_, temporaryRelease, err := manager.Acquire(context.Background(), "test-token")
 
 		if errors.Is(err, ErrClosed) {
 			break
