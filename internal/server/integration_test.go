@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -223,6 +224,148 @@ func TestRESP2WithRedis(t *testing.T) {
 
 	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" || strings.TrimSpace(response.Body.String()) != `[{"result":"hello"}]` {
 		t.Fatalf("unexpected multi-exec response: %d %q %q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+}
+
+func TestScanWithTypeWithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+	prefix := fmt.Sprintf("uprest:scan-with-type:%d", time.Now().UnixNano())
+	stringKey := prefix + ":string"
+	zsetKey := prefix + ":zset"
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		defer cancel()
+
+		if err := client.Del(ctx, stringKey, zsetKey).Err(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	defer cancel()
+
+	if err := client.Set(ctx, stringKey, "value", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.ZAdd(ctx, zsetKey, redis.Z{Score: 1, Member: "member"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := redisIntegrationHandler(t)
+	want := map[string]string{stringKey: "string", zsetKey: "zset"}
+	got := make(map[string]string)
+	cursor := "0"
+
+	for attempts := 0; ; attempts++ {
+		if attempts > 10000 {
+			t.Fatal("SCAN WITHTYPE did not return cursor 0")
+		}
+
+		response := serveCommand(t, handler, "/", []any{"SCAN", cursor, "MATCH", prefix + ":*", "COUNT", 1, "WITHTYPE"})
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("SCAN WITHTYPE returned %d: %s", response.Code, response.Body.String())
+		}
+
+		var body map[string]any
+
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+
+		pageCursor, page := scanWithTypeResult(t, body["result"])
+
+		maps.Copy(got, page)
+
+		cursor = pageCursor
+
+		if cursor == "0" {
+			break
+		}
+	}
+
+	if !maps.Equal(got, want) {
+		t.Fatalf("got SCAN WITHTYPE results %#v, want %#v", got, want)
+	}
+
+	fullCommand := []any{"SCAN", "0", "MATCH", prefix + ":*", "COUNT", 1000000, "WITHTYPE"}
+	path := "/scan/0/MATCH/" + url.PathEscape(prefix+":*") + "/COUNT/1000000/WITHTYPE"
+	pathResponse := servePathCommand(t, handler, http.MethodGet, path, nil, nil)
+
+	if pathResponse.Code != http.StatusOK {
+		t.Fatalf("path SCAN WITHTYPE returned %d: %s", pathResponse.Code, pathResponse.Body.String())
+	}
+
+	var pathBody map[string]any
+
+	if err := json.Unmarshal(pathResponse.Body.Bytes(), &pathBody); err != nil {
+		t.Fatal(err)
+	}
+
+	assertScanWithTypeResult(t, pathBody["result"], want)
+
+	pipelineResponse := serveCommand(t, handler, "/pipeline", []any{fullCommand, []any{"PING"}})
+
+	if pipelineResponse.Code != http.StatusOK {
+		t.Fatalf("pipeline SCAN WITHTYPE returned %d: %s", pipelineResponse.Code, pipelineResponse.Body.String())
+	}
+
+	var pipelineBody []map[string]any
+
+	if err := json.Unmarshal(pipelineResponse.Body.Bytes(), &pipelineBody); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pipelineBody) != 2 || pipelineBody[1]["result"] != "PONG" {
+		t.Fatalf("unexpected pipeline response: %#v", pipelineBody)
+	}
+
+	assertScanWithTypeResult(t, pipelineBody[0]["result"], want)
+
+	transactionResponse := serveCommand(t, handler, "/multi-exec", []any{fullCommand, []any{"PING"}})
+
+	if transactionResponse.Code != http.StatusOK {
+		t.Fatalf("transaction SCAN WITHTYPE returned %d: %s", transactionResponse.Code, transactionResponse.Body.String())
+	}
+
+	var transactionBody []map[string]any
+
+	if err := json.Unmarshal(transactionResponse.Body.Bytes(), &transactionBody); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(transactionBody) != 2 || transactionBody[1]["result"] != "PONG" {
+		t.Fatalf("unexpected transaction response: %#v", transactionBody)
+	}
+
+	assertScanWithTypeResult(t, transactionBody[0]["result"], want)
+
+	commandBody, err := json.Marshal(fullCommand)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp2Response := servePathCommand(t, handler, http.MethodPost, "/", commandBody, map[string]string{
+		responseFormatHeader: "resp2",
+	})
+
+	if resp2Response.Code != http.StatusOK || resp2Response.Header().Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("RESP2 SCAN WITHTYPE returned %d %q: %q", resp2Response.Code, resp2Response.Header().Get("Content-Type"), resp2Response.Body.String())
+	}
+
+	responsePrefix := "*2\r\n$1\r\n0\r\n*4\r\n"
+	stringPair := fmt.Sprintf("$%d\r\n%s\r\n$6\r\nstring\r\n", len(stringKey), stringKey)
+	zsetPair := fmt.Sprintf("$%d\r\n%s\r\n$4\r\nzset\r\n", len(zsetKey), zsetKey)
+	wantFirstOrder := responsePrefix + stringPair + zsetPair
+	wantSecondOrder := responsePrefix + zsetPair + stringPair
+
+	if gotResponse := resp2Response.Body.String(); gotResponse != wantFirstOrder && gotResponse != wantSecondOrder {
+		t.Fatalf("unexpected RESP2 SCAN WITHTYPE response: %q", gotResponse)
 	}
 }
 
@@ -799,6 +942,53 @@ func redisIntegrationClient(t *testing.T) *redis.Client {
 	})
 
 	return client
+}
+
+func scanWithTypeResult(t *testing.T, value any) (string, map[string]string) {
+	t.Helper()
+
+	result, ok := value.([]any)
+
+	if !ok || len(result) != 2 {
+		t.Fatalf("got SCAN WITHTYPE result %#v, want [cursor, items]", value)
+	}
+
+	cursor, ok := result[0].(string)
+
+	if !ok {
+		t.Fatalf("got SCAN WITHTYPE cursor %#v, want string", result[0])
+	}
+
+	items, ok := result[1].([]any)
+
+	if !ok || len(items)%2 != 0 {
+		t.Fatalf("got SCAN WITHTYPE items %#v, want key/type pairs", result[1])
+	}
+
+	values := make(map[string]string, len(items)/2)
+
+	for index := 0; index < len(items); index += 2 {
+		key, keyOK := items[index].(string)
+		keyType, typeOK := items[index+1].(string)
+
+		if !keyOK || !typeOK {
+			t.Fatalf("got SCAN WITHTYPE pair %#v, want strings", items[index:index+2])
+		}
+
+		values[key] = keyType
+	}
+
+	return cursor, values
+}
+
+func assertScanWithTypeResult(t *testing.T, value any, want map[string]string) {
+	t.Helper()
+
+	cursor, got := scanWithTypeResult(t, value)
+
+	if cursor != "0" || !maps.Equal(got, want) {
+		t.Fatalf("got SCAN WITHTYPE cursor %q and values %#v, want cursor 0 and values %#v", cursor, got, want)
+	}
 }
 
 func monitorConnectionCount(t *testing.T, client *redis.Client) int {

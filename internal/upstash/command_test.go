@@ -85,6 +85,82 @@ func TestDecodePipelineRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestRewriteScanWithType(t *testing.T) {
+	tests := []struct {
+		name    string
+		command []any
+		want    []any
+	}{
+		{
+			name:    "minimal command",
+			command: []any{"SCAN", "0", "WITHTYPE"},
+			want:    []any{"EVAL", scanWithTypeScript, 0, "0"},
+		},
+		{
+			name:    "case insensitive options",
+			command: []any{"scan", "42", "match", "prefix:*", "COUNT", "10", "type", "string", "withtype"},
+			want:    []any{"EVAL", scanWithTypeScript, 0, "42", "match", "prefix:*", "COUNT", "10", "type", "string"},
+		},
+		{
+			name:    "with type before standard options",
+			command: []any{"SCAN", "0", "WITHTYPE", "MATCH", "prefix:*", "COUNT", "100"},
+			want:    []any{"EVAL", scanWithTypeScript, 0, "0", "MATCH", "prefix:*", "COUNT", "100"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := append([]any(nil), test.command...)
+			got, changed := RewriteScanWithType(test.command)
+
+			if !changed {
+				t.Fatal("expected command rewrite")
+			}
+
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+
+			if !reflect.DeepEqual(test.command, original) {
+				t.Fatalf("input command changed: got %#v, want %#v", test.command, original)
+			}
+		})
+	}
+}
+
+func TestRewriteScanWithTypeLeavesUnsupportedCommandsUnchanged(t *testing.T) {
+	tests := []struct {
+		name    string
+		command []any
+	}{
+		{"standard scan", []any{"SCAN", "0", "COUNT", "10"}},
+		{"different command", []any{"GET", "WITHTYPE"}},
+		{"match value", []any{"SCAN", "0", "MATCH", "WITHTYPE"}},
+		{"count value", []any{"SCAN", "0", "COUNT", "WITHTYPE"}},
+		{"type value", []any{"SCAN", "0", "TYPE", "WITHTYPE"}},
+		{"duplicate with type", []any{"SCAN", "0", "WITHTYPE", "WITHTYPE"}},
+		{"missing option value", []any{"SCAN", "0", "WITHTYPE", "MATCH"}},
+		{"unknown option", []any{"SCAN", "0", "WITHTYPE", "UNKNOWN"}},
+		{"non-string option", []any{"SCAN", "0", "WITHTYPE", 1}},
+		{"non-string command", []any{[]byte("SCAN"), "0", "WITHTYPE"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := append([]any(nil), test.command...)
+			got, changed := RewriteScanWithType(test.command)
+
+			if changed {
+				t.Fatal("unexpected command rewrite")
+			}
+
+			if !reflect.DeepEqual(got, original) || !reflect.DeepEqual(test.command, original) {
+				t.Fatalf("command changed: got %#v, input %#v, want %#v", got, test.command, original)
+			}
+		})
+	}
+}
+
 func TestDecodePathCommand(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -176,6 +176,10 @@ Each monitor uses a dedicated Redis connection and shares the backend's `UPREST_
 
 uprest works with `@upstash/ratelimit`, including versions 2.1.0 and later. It removes the Upstash-only `allow-key-locking` Lua flag before forwarding scripts to Redis and maps subsequent `EVALSHA` requests to the normalized script.
 
+### SCAN with key types
+
+The `@upstash/redis` `scan` option `{ withType: true }` is supported for commands, pipelines, and transactions. uprest translates `SCAN WITHTYPE` into a read-only Lua script, so the configured Redis user must be allowed to run `EVAL`, `SCAN`, and `TYPE`.
+
 ### Known differences
 
 Upstash Search and Vector commands, some RedisJSON response details, and selected Upstash-specific command behavior are not supported. The compatibility exclusions are documented in [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt).
