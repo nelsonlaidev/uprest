@@ -1,6 +1,6 @@
-# uprest
+# Uprest
 
-uprest is a local HTTP-to-Redis proxy for applications that use the Upstash Redis REST API. It forwards requests to a real Redis server, so applications can keep using `@upstash/redis` during local development and CI.
+Uprest is a local HTTP-to-Redis proxy for applications that use the Upstash Redis REST API. It forwards requests to a real Redis server, so applications can keep using `@upstash/redis` during local development and CI.
 
 It supports Redis commands, pipelines, transactions, Pub/Sub over Server-Sent Events (SSE), JSON and RESP2 responses, bearer or query-token authentication, and recent `@upstash/ratelimit` versions.
 
@@ -34,7 +34,7 @@ Start both services:
 docker compose up -d
 ```
 
-Then point `@upstash/redis` at uprest:
+Then point `@upstash/redis` at Uprest:
 
 ```ts
 import { Redis } from '@upstash/redis'
@@ -66,7 +66,7 @@ curl -X POST http://localhost:8079/ \
 
 The response is `{"result":"OK"}`.
 
-To connect uprest to an existing Redis server instead, run only the proxy:
+To connect Uprest to an existing Redis server instead, run only the proxy:
 
 ```sh
 docker run --rm -d -p 8079:8080 --name uprest \
@@ -79,7 +79,7 @@ The image listens on port `8080`. These examples use the `latest` tag, which tra
 
 ## Configuration
 
-uprest reads `UPREST_*` environment variables. `UPREST_MODE` selects one Redis backend from environment variables or multiple backends from a JSON file.
+Uprest reads `UPREST_*` environment variables. `UPREST_MODE` selects one Redis backend from environment variables or multiple backends from a JSON file.
 
 | Variable                   | Default                          | Purpose                                               |
 | -------------------------- | -------------------------------- | ----------------------------------------------------- |
@@ -174,17 +174,17 @@ Each monitor uses a dedicated Redis connection and shares the backend's `UPREST_
 
 ### Rate limiting
 
-uprest works with `@upstash/ratelimit`, including versions 2.1.0 and later. It removes the Upstash-only `allow-key-locking` Lua flag before forwarding scripts to Redis and maps subsequent `EVALSHA` requests to the normalized script.
+Uprest works with `@upstash/ratelimit`, including versions 2.1.0 and later. It removes the Upstash-only `allow-key-locking` Lua flag before forwarding scripts to Redis and maps subsequent `EVALSHA` requests to the normalized script.
 
 ### SCAN with key types
 
-The `@upstash/redis` `scan` option `{ withType: true }` is supported for commands, pipelines, and transactions. uprest translates `SCAN WITHTYPE` into a read-only Lua script, so the configured Redis user must be allowed to run `EVAL`, `SCAN`, and `TYPE`.
+The `@upstash/redis` `scan` option `{ withType: true }` is supported for commands, pipelines, and transactions. Uprest translates `SCAN WITHTYPE` into a read-only Lua script, so the configured Redis user must be allowed to run `EVAL`, `SCAN`, and `TYPE`.
 
 ### Known differences
 
 Upstash Search and Vector commands, some RedisJSON response details, and selected Upstash-specific command behavior are not supported. The compatibility exclusions are documented in [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt).
 
-uprest returns an opaque `Upstash-Sync-Token`, but it does not coordinate replicas with an incoming token because each authentication token routes to one Redis backend.
+Uprest returns an opaque `Upstash-Sync-Token`, but it does not coordinate replicas with an incoming token because each authentication token routes to one Redis backend.
 
 ### Operations
 
@@ -196,7 +196,7 @@ The server uses a 5-second header-read timeout, 15-second read timeout, 50-secon
 
 ### GitHub Actions
 
-uprest can run as a service container alongside Redis, so CI does not need an Upstash database:
+Uprest can run as a service container alongside Redis, so CI does not need an Upstash database:
 
 ```yaml
 jobs:
@@ -237,7 +237,7 @@ Stable releases also use the `latest` tag. See [`CHANGELOG.md`](CHANGELOG.md) fo
 
 When migrating from [`hiett/serverless-redis-http`](https://github.com/hiett/serverless-redis-http) (SRH), update these environment variables:
 
-| SRH                     | uprest                     |
+| SRH                     | Uprest                     |
 | ----------------------- | -------------------------- |
 | `SRH_MODE`              | `UPREST_MODE`              |
 | `SRH_TOKEN`             | `UPREST_TOKEN`             |
@@ -261,7 +261,7 @@ go test ./...
 go vet ./...
 ```
 
-The bundled [`examples/docker-compose.yml`](examples/docker-compose.yml) builds uprest from source:
+The bundled [`examples/docker-compose.yml`](examples/docker-compose.yml) builds Uprest from source:
 
 ```sh
 just up
@@ -273,7 +273,7 @@ The SDK tests cover `@upstash/redis` commands, pipelines, and transactions, plus
 
 The compatibility workflow also runs the official `upstash/redis-js` `packages/redis` suite. Pull requests and pushes to `main` use pinned upstream commit `6b2772753067e7d1aa103de25a3ee37bfd98093a`; the scheduled workflow tests upstream `main`.
 
-To run that suite locally, start Redis and uprest, clone `upstash/redis-js`, then run:
+To run that suite locally, start Redis and Uprest, clone `upstash/redis-js`, then run:
 
 ```sh
 tests/compatibility/run.sh /path/to/redis-js
@@ -283,4 +283,4 @@ The script modifies the checkout without committing, so use a disposable clone. 
 
 ## License
 
-uprest is licensed under the [MIT License](LICENSE).
+Uprest is licensed under the [MIT License](LICENSE).
