@@ -115,6 +115,8 @@ Each token selects its configured Redis backend. `max_connections` is optional a
 
 | Endpoint                   | Method | Request                                             |
 | -------------------------- | ------ | --------------------------------------------------- |
+| `/health`                  | `GET`  | HTTP liveness check; no authentication required     |
+| `/ready`                   | `GET`  | Authenticated Redis backend readiness check         |
 | `/`                        | `POST` | JSON command array                                  |
 | `/pipeline`                | `POST` | JSON array of commands                              |
 | `/multi-exec`              | `POST` | JSON array of commands run in Redis `MULTI`/`EXEC`  |
@@ -124,7 +126,7 @@ Each token selects its configured Redis backend. `max_connections` is optional a
 | `/<command>/<args...>`     | `GET`  | URL-encoded arguments                               |
 | `/<command>/<args...>`     | `POST` | URL arguments and the body as the final Redis value |
 
-Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. An `Authorization` header takes precedence and does not fall back to `_token` when malformed or invalid.
+Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. An `Authorization` header takes precedence and does not fall back to `_token` when malformed or invalid. Only `/health` is available without authentication.
 
 An empty path-command `POST` body becomes an empty Redis argument; use `GET` when no body argument is needed. Request bodies are limited to 10 MiB. `HEAD` and `PUT` command requests are unsupported.
 
@@ -187,6 +189,19 @@ Upstash Search and Vector commands, some RedisJSON response details, and selecte
 Uprest returns an opaque `Upstash-Sync-Token`, but it does not coordinate replicas with an incoming token because each authentication token routes to one Redis backend.
 
 ### Operations
+
+Use `GET /health` to check HTTP liveness without contacting Redis. It returns `200` with `{"status":"ok"}`, or `503` with `{"status":"shutting_down"}` when the server's shutdown context is canceled. Redis outages and connection saturation do not affect this check.
+
+Use authenticated `GET /ready` to check whether the token's backend can accept a request and respond to Redis `PING`:
+
+```sh
+curl --fail http://localhost:8079/health
+curl --fail -H 'Authorization: Bearer example-token' http://localhost:8079/ready
+```
+
+Readiness returns `200` with `{"status":"ready"}` on success, or `503` with `{"status":"not_ready"}` when acquiring capacity or probing Redis fails. Capacity acquisition, connection initialization, and `PING` share a 2-second deadline. Missing or invalid authentication returns `401`. In file mode, only the backend selected by the token is checked; another backend's outage does not affect it.
+
+Both endpoints accept only `GET`, return JSON with `Cache-Control: no-store`, and ignore Upstash response-format and encoding headers. The configured Redis user must be allowed to run `PING`. Readiness uses the normal pool and connection limit, does not cache results, and keeps the selected pool active when probed regularly. Use `/health` for liveness and `/ready` for readiness so a Redis outage does not trigger a process restart. The bundled Compose example waits for Redis's healthcheck before starting Uprest.
 
 Request, pool lifecycle, and shutdown events use structured JSON logs without bearer tokens or Redis connection strings. Set `UPREST_LOG_LEVEL=debug` to include script-normalization events.
 

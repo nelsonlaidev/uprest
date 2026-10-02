@@ -23,6 +23,171 @@ import (
 	"github.com/nelsonlaidev/uprest/internal/redisproxy"
 )
 
+func TestReadyWithRedis(t *testing.T) {
+	var logs bytes.Buffer
+	handler, manager := newTestServer(t, []redisproxy.Backend{
+		{
+			Token:            "test-token",
+			ID:               "healthy",
+			ConnectionString: redisIntegrationURL(t),
+			MaxConnections:   1,
+		},
+		{
+			Token:            "offline-token",
+			ID:               "offline",
+			ConnectionString: "redis://localhost:1",
+			MaxConnections:   1,
+		},
+	}, &logs)
+
+	for _, test := range []struct {
+		name   string
+		path   string
+		token  string
+		status int
+		want   string
+	}{
+		{"healthy backend", "/ready", "test-token", http.StatusOK, `{"status":"ready"}`},
+		{"unavailable backend", "/ready", "offline-token", http.StatusServiceUnavailable, `{"status":"not_ready"}`},
+		{"healthy backend remains isolated", "/ready?_token=test-token", "", http.StatusOK, `{"status":"ready"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			logs.Reset()
+
+			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request.Header.Set("Upstash-Response-Format", "invalid")
+			request.Header.Set("Upstash-Encoding", "base64")
+
+			if test.token != "" {
+				request.Header.Set("Authorization", "Bearer "+test.token)
+			}
+
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != test.status || strings.TrimSpace(response.Body.String()) != test.want {
+				t.Fatalf("got %d %q, want %d %q", response.Code, response.Body.String(), test.status, test.want)
+			}
+
+			if response.Header().Get("Content-Type") != "application/json" || response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("unexpected readiness headers: %v", response.Header())
+			}
+
+			decoder := json.NewDecoder(&logs)
+			var requestLog map[string]any
+
+			for {
+				var entry map[string]any
+				decodeErr := decoder.Decode(&entry)
+
+				if errors.Is(decodeErr, io.EOF) {
+					break
+				}
+
+				if decodeErr != nil {
+					t.Fatal(decodeErr)
+				}
+
+				if entry["msg"] == "request completed" {
+					requestLog = entry
+				}
+			}
+
+			wantLevel := "INFO"
+
+			if test.status == http.StatusOK {
+				wantLevel = "DEBUG"
+			}
+
+			if requestLog["level"] != wantLevel || requestLog["status"] != float64(test.status) {
+				t.Fatalf("unexpected readiness log: %#v", requestLog)
+			}
+
+			token := test.token
+
+			if token == "" {
+				token = "test-token"
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+
+			defer cancel()
+
+			_, release, err := manager.Acquire(ctx, token)
+
+			if err != nil {
+				t.Fatalf("probe leaked capacity: %v", err)
+			}
+
+			release()
+		})
+	}
+
+	_, release, err := manager.AcquireDedicated(context.Background(), "test-token")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer release()
+
+	health := httptest.NewRecorder()
+
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if health.Code != http.StatusOK {
+		t.Fatalf("capacity exhaustion affected health: %d %q", health.Code, health.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	request.Header.Set("Authorization", "Bearer test-token")
+	response := httptest.NewRecorder()
+	started := time.Now()
+
+	handler.ServeHTTP(response, request)
+
+	if elapsed := time.Since(started); elapsed < readinessTimeout-100*time.Millisecond || elapsed > readinessTimeout+2*time.Second {
+		t.Fatalf("capacity wait took %s, want approximately %s", elapsed, readinessTimeout)
+	}
+
+	if response.Code != http.StatusServiceUnavailable || strings.TrimSpace(response.Body.String()) != `{"status":"not_ready"}` {
+		t.Fatalf("unexpected exhausted capacity response: %d %q", response.Code, response.Body.String())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	response = httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request.WithContext(ctx))
+	cancel()
+
+	if response.Body.Len() != 0 {
+		t.Fatalf("canceled capacity wait wrote a response: %q", response.Body.String())
+	}
+
+	release()
+
+	response = httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || strings.TrimSpace(response.Body.String()) != `{"status":"ready"}` {
+		t.Fatalf("readiness did not recover after capacity was released: %d %q", response.Code, response.Body.String())
+	}
+
+	leaseCtx, stop := context.WithTimeout(context.Background(), time.Second)
+
+	defer stop()
+
+	_, releaseLease, err := manager.Acquire(leaseCtx, "test-token")
+
+	if err != nil {
+		t.Fatalf("recovered probe leaked capacity: %v", err)
+	}
+
+	releaseLease()
+}
+
 func TestPipelineWithRedis(t *testing.T) {
 	client := redisIntegrationClient(t)
 

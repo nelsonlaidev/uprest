@@ -145,6 +145,7 @@ func (m *Manager) Acquire(ctx context.Context, token string) (*redis.Client, fun
 
 	if pool == nil {
 		options := poolBackend.options
+		options.ContextTimeoutEnabled = true
 		pool = &managedPool{
 			backend:  poolBackend,
 			client:   redis.NewClient(&options),

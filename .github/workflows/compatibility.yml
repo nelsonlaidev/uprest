@@ -77,10 +77,8 @@ jobs:
             uprest:compatibility
 
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error --request POST "$UPSTASH_REDIS_REST_URL" \
-              --header "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" \
-              --header "Content-Type: application/json" \
-              --data '["PING"]' | grep -q '"result":"PONG"'; then
+            if curl --fail --silent --show-error "${UPSTASH_REDIS_REST_URL%/}/ready" \
+              --header "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" | grep -q '"status":"ready"'; then
               exit 0
             fi
 

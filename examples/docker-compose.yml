@@ -3,8 +3,16 @@ services:
     image: redis:8.10.2
     ports:
       - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 10
 
   uprest:
+    depends_on:
+      redis:
+        condition: service_healthy
     build:
       context: ..
     ports:
