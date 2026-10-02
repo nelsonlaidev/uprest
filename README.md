@@ -203,7 +203,11 @@ Readiness returns `200` with `{"status":"ready"}` on success, or `503` with `{"s
 
 Both endpoints accept only `GET`, return JSON with `Cache-Control: no-store`, and ignore Upstash response-format and encoding headers. The configured Redis user must be allowed to run `PING`. Readiness uses the normal pool and connection limit, does not cache results, and keeps the selected pool active when probed regularly. Use `/health` for liveness and `/ready` for readiness so a Redis outage does not trigger a process restart. The bundled Compose example waits for Redis's healthcheck before starting Uprest.
 
-Request, pool lifecycle, and shutdown events use structured JSON logs without bearer tokens or Redis connection strings. Set `UPREST_LOG_LEVEL=debug` to include script-normalization events.
+The exact paths `/health` and `/ready` are reserved HTTP endpoints and no longer forward Redis path commands. Applications needing to send commands with those names must use the JSON command endpoint at `POST /`.
+
+Request, pool lifecycle, and shutdown events use structured JSON logs without bearer tokens or Redis connection strings. Successful health and readiness requests are logged at `debug`; failed probes remain at `info`. Requests canceled before writing a response are logged as `request canceled` with `canceled: true` and no HTTP status. Set `UPREST_LOG_LEVEL=debug` to include successful probes and script-normalization events.
+
+All commands using shared Redis pools now respect context deadlines for socket reads and writes, including individual commands, pipelines, and transactions. This applies beyond readiness checks. Client disconnection and shutdown cancel request contexts, but cancellation does not guarantee immediate interruption of an in-flight socket operation or stop a command already executing in Redis.
 
 The server uses a 5-second header-read timeout, 15-second read timeout, 50-second write timeout, and 60-second keep-alive timeout. Redis commands, backend connection acquisition, and initial Pub/Sub or `MONITOR` confirmation have a 30-second deadline. When a backend reaches its connection limit, a request waits for capacity until that deadline and then returns `503`. On shutdown, active request contexts are cancelled before the server waits up to 10 seconds for handlers to exit.
 
@@ -247,6 +251,24 @@ docker pull nelsonlaidev/uprest:v0.3.0
 ```
 
 Stable releases also use the `latest` tag. See [`CHANGELOG.md`](CHANGELOG.md) for release history.
+
+To publish a release, push the release commits first, then create and push an annotated tag:
+
+```sh
+git tag -a v0.4.0 -F - <<'EOF'
+### Highlights
+
+- Add public `GET /health` for HTTP liveness and authenticated `GET /ready` for Redis backend readiness.
+
+### Breaking changes
+
+- The exact `/health` and `/ready` paths are now reserved. Send Redis commands with those names through `POST /` using a JSON command array.
+- Shared Redis pools now honor request context deadlines for socket I/O across all commands. Cancellation does not guarantee immediate socket interruption or stop commands already executing in Redis.
+EOF
+git push origin v0.4.0
+```
+
+The tag message supports Markdown and appears in both the release notes and changelog; use it for release highlights and migration instructions. Use level-three headings such as `### Highlights` and `### Breaking changes` so they sit below the changelog's level-two version headings. Conventional Commits supply the individual change entries. The release workflow generates the changelog included in each archive and, after publication succeeds, commits an updated `CHANGELOG.md` to the default branch. The default branch must allow `github-actions[bot]` to push with `GITHUB_TOKEN`. Manual changelog edits are overwritten by generation; use `just changelog <version>` for a local preview.
 
 ## Migrate from SRH
 

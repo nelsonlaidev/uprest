@@ -42,7 +42,7 @@ compatibility checkout url="http://localhost:8079" token="example-token":
     UPSTASH_REDIS_REST_URL={{url}} UPSTASH_REDIS_REST_TOKEN={{token}} tests/compatibility/run.sh {{checkout}}
 
 changelog version:
-    git-cliff --tag {{version}} --output CHANGELOG.md
+    git-cliff --use-branch-tags --tag {{version}}
 
 up:
     {{compose}} up --build -d

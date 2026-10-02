@@ -10,7 +10,7 @@
 
 ## Releasing
 
-1. Run `just changelog <version>` to regenerate `CHANGELOG.md`, then review and commit it.
-2. Create and push a tag matching the version, for example `git tag v0.1.0 && git push origin v0.1.0`.
+1. Ensure the release changes are committed and pushed. Use Conventional Commits; record breaking changes with `!` or a `BREAKING CHANGE` footer.
+2. Create and push an annotated version tag. Follow the README's multi-line annotation example, using `### Highlights` and `### Breaking changes` for release notes and migration instructions.
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which publishes the release archives and the multi-arch container images to GHCR and Docker Hub.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which generates release notes and an archive changelog from Git history and annotated tag messages, then publishes the release archives and the multi-arch container images to GHCR and Docker Hub. After publication succeeds, the workflow regenerates and commits `CHANGELOG.md` to the default branch. Do not manually edit `CHANGELOG.md`; `just changelog <version>` is available for a local preview. The default branch must allow changelog pushes from `github-actions[bot]` using `GITHUB_TOKEN`.

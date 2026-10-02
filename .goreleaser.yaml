@@ -29,6 +29,11 @@ archives:
       - goos: windows
         formats:
           - zip
+    files:
+      - README.md
+      - LICENSE
+      - src: '{{ envOrDefault "RELEASE_CHANGELOG" "CHANGELOG.md" }}'
+        strip_parent: true
 
 checksum:
   name_template: checksums.txt

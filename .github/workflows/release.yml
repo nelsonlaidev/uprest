@@ -26,9 +26,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify release changelog
-        run: grep -Fxq -- "## ${GITHUB_REF_NAME}" CHANGELOG.md
-
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -43,6 +40,15 @@ jobs:
           args: --current --strip header
         env:
           OUTPUT: ${{ runner.temp }}/release-notes.md
+
+      - name: Generate archive changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          version: v2.14.2
+          config: cliff.toml
+          args: --use-branch-tags
+        env:
+          OUTPUT: ${{ runner.temp }}/CHANGELOG.md
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -71,3 +77,47 @@ jobs:
           args: release --clean --release-notes=${{ runner.temp }}/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_CHANGELOG: ${{ runner.temp }}/CHANGELOG.md
+
+  changelog:
+    needs: release
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: changelog-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Generate repository changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          version: v2.14.2
+          config: cliff.toml
+          args: --use-branch-tags
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Commit and push changelog
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "Changelog is already up to date."
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore: update changelog"
+          git pull --rebase origin "$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
