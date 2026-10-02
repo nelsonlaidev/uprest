@@ -255,7 +255,7 @@ Stable releases also use the `latest` tag. See [`CHANGELOG.md`](CHANGELOG.md) fo
 To publish a release, push the release commits first, then create and push an annotated tag:
 
 ```sh
-git tag -a v0.4.0 -F - <<'EOF'
+git tag -a v0.4.0 --cleanup=verbatim -F - <<'EOF'
 ### Highlights
 
 - Add public `GET /health` for HTTP liveness and authenticated `GET /ready` for Redis backend readiness.
@@ -268,7 +268,7 @@ EOF
 git push origin v0.4.0
 ```
 
-The tag message supports Markdown and appears in both the release notes and changelog; use it for release highlights and migration instructions. Use level-three headings such as `### Highlights` and `### Breaking changes` so they sit below the changelog's level-two version headings. Conventional Commits supply the individual change entries. The release workflow generates the changelog included in each archive and, after publication succeeds, commits an updated `CHANGELOG.md` to the default branch. The default branch must allow `github-actions[bot]` to push with `GITHUB_TOKEN`. Manual changelog edits are overwritten by generation; use `just changelog <version>` for a local preview.
+The tag message supports Markdown and appears in both the release notes and changelog; use it for release highlights and migration instructions. Use `--cleanup=verbatim` to preserve Markdown headings, which Git's default cleanup treats as comments. Use level-three headings such as `### Highlights` and `### Breaking changes` so they sit below the changelog's level-two version headings. Conventional Commits supply the individual change entries. The release workflow generates the changelog included in each archive and, after publication succeeds, commits an updated `CHANGELOG.md` to the default branch. The default branch must allow `github-actions[bot]` to push with `GITHUB_TOKEN`. Manual changelog edits are overwritten by generation; use `just changelog <version>` for a local preview.
 
 ## Migrate from SRH
 
