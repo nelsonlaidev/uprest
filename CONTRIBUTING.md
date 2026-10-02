@@ -81,7 +81,7 @@ git push origin v0.4.0
 
 Use `--cleanup=verbatim` to preserve Markdown headings, and level-three headings such as `### Highlights` and `### Breaking changes` so they sit below the changelog's version headings.
 
-Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which publishes release archives and multi-arch container images to GHCR and Docker Hub. After publication, the workflow regenerates and commits `CHANGELOG.md` to the default branch. Do not edit `CHANGELOG.md` manually; `just changelog <version>` previews it locally.
+Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which publishes release archives and multi-arch container images to GHCR and Docker Hub. After publication, the workflow regenerates `CHANGELOG.md` and opens a pull request for a maintainer to review and merge. The repository must allow GitHub Actions to create pull requests (Settings → Actions → General → Workflow permissions). Do not edit `CHANGELOG.md` manually; `just changelog <version>` previews it locally.
 
 ## CI
 
