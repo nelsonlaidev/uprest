@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +46,224 @@ func (w *sseDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
 	w.deadlines = append(w.deadlines, deadline)
 
 	return nil
+}
+
+func TestHealthAndReadyValidation(t *testing.T) {
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
+		Token:            "test-token",
+		ID:               "test",
+		ConnectionString: "redis://localhost:1",
+		MaxConnections:   1,
+	}}, io.Discard)
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		token  string
+		status int
+		want   string
+		allow  string
+	}{
+		{"health without token", http.MethodGet, "/health", "", http.StatusOK, `{"status":"ok"}`, ""},
+		{"health with invalid token", http.MethodGet, "/health", "Bearer wrong", http.StatusOK, `{"status":"ok"}`, ""},
+		{"health POST", http.MethodPost, "/health", "", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`, http.MethodGet},
+		{"health HEAD", http.MethodHead, "/health", "", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`, http.MethodGet},
+		{"ready without token", http.MethodGet, "/ready", "", http.StatusUnauthorized, `{"error":"Unauthorized"}`, ""},
+		{"ready with invalid token", http.MethodGet, "/ready", "Bearer wrong", http.StatusUnauthorized, `{"error":"Unauthorized"}`, ""},
+		{"ready header overrides query", http.MethodGet, "/ready?_token=test-token", "Bearer wrong", http.StatusUnauthorized, `{"error":"Unauthorized"}`, ""},
+		{"ready malformed header overrides query", http.MethodGet, "/ready?_token=test-token", "Basic test-token", http.StatusUnauthorized, `{"error":"Unauthorized"}`, ""},
+		{"ready POST", http.MethodPost, "/ready", "Bearer test-token", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`, http.MethodGet},
+		{"ready HEAD", http.MethodHead, "/ready", "Bearer test-token", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`, http.MethodGet},
+		{"ready authenticates before method", http.MethodPost, "/ready", "", http.StatusUnauthorized, `{"error":"Unauthorized"}`, ""},
+		{"ready query token POST", http.MethodPost, "/ready?_token=test-token", "", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`, http.MethodGet},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("Upstash-Response-Format", "resp2")
+			request.Header.Set("Upstash-Encoding", "base64")
+
+			if test.token != "" {
+				request.Header.Set("Authorization", test.token)
+			}
+
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != test.status || strings.TrimSpace(response.Body.String()) != test.want {
+				t.Fatalf("got %d %q, want %d %q", response.Code, response.Body.String(), test.status, test.want)
+			}
+
+			if response.Header().Get("Allow") != test.allow || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("unexpected probe headers: %v", response.Header())
+			}
+		})
+	}
+
+	for _, path := range []string{"/health", "/ready"} {
+		if !reservedPath(path) || allowedMethods(path) != http.MethodGet {
+			t.Fatalf("probe %q has inconsistent routing classification", path)
+		}
+	}
+
+	for _, path := range []string{"/Health", "/health/", "/Ready", "/ready/", "/healthz", "/readyz"} {
+		if reservedPath(path) || allowedMethods(path) != http.MethodGet+", "+http.MethodPost {
+			t.Fatalf("path command %q unexpectedly classified as a probe", path)
+		}
+
+		response := httptest.NewRecorder()
+
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("path %q unexpectedly matched a probe: %d", path, response.Code)
+		}
+	}
+
+	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
+		t.Fatalf("probe validation created a Redis pool: %+v", stats)
+	}
+}
+
+func TestHealthShutdownAndReadyCancellation(t *testing.T) {
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
+		Token:            "test-token",
+		ID:               "test",
+		ConnectionString: "redis://localhost:1",
+		MaxConnections:   1,
+	}}, io.Discard)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	request := httptest.NewRequest(http.MethodGet, "/health", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable || strings.TrimSpace(response.Body.String()) != `{"status":"shutting_down"}` {
+		t.Fatalf("unexpected shutdown health response: %d %q", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/ready", nil).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer test-token")
+	response = httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Body.Len() != 0 {
+		t.Fatalf("canceled request wrote a response: %q", response.Body.String())
+	}
+
+	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
+		t.Fatalf("canceled readiness created a Redis pool: %+v", stats)
+	}
+}
+
+func TestReadyColdConnectionDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		wait   bool
+		cancel bool
+	}{
+		{name: "stalled handshake"},
+		{name: "capacity and handshake share deadline", wait: true},
+		{name: "cancel during handshake", cancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { _ = listener.Close() })
+
+			accepted := make(chan struct{})
+
+			go func() {
+				connection, acceptErr := listener.Accept()
+
+				if acceptErr != nil {
+					return
+				}
+
+				t.Cleanup(func() { _ = connection.Close() })
+
+				defer func() { _ = connection.Close() }()
+				close(accepted)
+				_, _ = io.Copy(io.Discard, connection)
+			}()
+
+			handler, manager := newTestServer(t, []redisproxy.Backend{{
+				Token:            "test-token",
+				ID:               "test",
+				ConnectionString: "redis://" + listener.Addr().String(),
+				MaxConnections:   1,
+			}}, io.Discard)
+
+			if test.wait {
+				_, release, acquireErr := manager.Acquire(context.Background(), "test-token")
+
+				if acquireErr != nil {
+					t.Fatal(acquireErr)
+				}
+
+				defer release()
+
+				timer := time.AfterFunc(time.Second, release)
+
+				defer timer.Stop()
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			defer cancel()
+
+			if test.cancel {
+				go func() {
+					select {
+					case <-accepted:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+
+			request := httptest.NewRequest(http.MethodGet, "/ready", nil).WithContext(ctx)
+			request.Header.Set("Authorization", "Bearer test-token")
+			response := httptest.NewRecorder()
+			started := time.Now()
+
+			handler.ServeHTTP(response, request)
+
+			if elapsed := time.Since(started); (!test.cancel && elapsed < readinessTimeout-100*time.Millisecond) || elapsed > readinessTimeout+2*time.Second {
+				t.Fatalf("cold connection probe took %s, want approximately %s", elapsed, readinessTimeout)
+			}
+
+			if test.cancel {
+				if response.Body.Len() != 0 {
+					t.Fatalf("canceled probe wrote a response: %q", response.Body.String())
+				}
+			} else if response.Code != http.StatusServiceUnavailable || strings.TrimSpace(response.Body.String()) != `{"status":"not_ready"}` {
+				t.Fatalf("unexpected stalled probe response: %d %q", response.Code, response.Body.String())
+			}
+
+			leaseCtx, stop := context.WithTimeout(context.Background(), time.Second)
+
+			defer stop()
+
+			_, release, acquireErr := manager.Acquire(leaseCtx, "test-token")
+
+			if acquireErr != nil {
+				t.Fatalf("probe leaked capacity: %v", acquireErr)
+			}
+
+			release()
+		})
+	}
 }
 
 func TestHandlerRejectsUnauthorizedAndMalformedRequests(t *testing.T) {
@@ -166,35 +385,102 @@ func TestQueryTokenAuthentication(t *testing.T) {
 }
 
 func TestRequestLogging(t *testing.T) {
-	var logs bytes.Buffer
-	handler, _ := newTestServer(t, []redisproxy.Backend{{
-		Token:            "test-token",
-		ID:               "test",
-		ConnectionString: "redis://localhost:1",
-		MaxConnections:   3,
-	}}, &logs)
+	for _, test := range []struct {
+		name     string
+		method   string
+		path     string
+		token    string
+		cancel   bool
+		occupy   bool
+		level    slog.Level
+		silent   bool
+		status   int
+		logLevel string
+	}{
+		{name: "command authentication failure", method: http.MethodGet, path: "/ping", status: http.StatusUnauthorized, logLevel: "INFO"},
+		{name: "successful health at debug", method: http.MethodGet, path: "/health", level: slog.LevelDebug, status: http.StatusOK, logLevel: "DEBUG"},
+		{name: "successful health hidden at info", method: http.MethodGet, path: "/health", silent: true, status: http.StatusOK},
+		{name: "failed readiness visible at info", method: http.MethodGet, path: "/ready", status: http.StatusUnauthorized, logLevel: "INFO"},
+		{name: "unsupported health method visible at info", method: http.MethodPost, path: "/health", status: http.StatusMethodNotAllowed, logLevel: "INFO"},
+		{name: "shutdown health visible at info", method: http.MethodGet, path: "/health", cancel: true, status: http.StatusServiceUnavailable, logLevel: "INFO"},
+		{name: "canceled readiness without response", method: http.MethodGet, path: "/ready", token: "test-token", cancel: true, logLevel: "INFO"},
+		{name: "canceled command capacity wait", method: http.MethodPost, path: "/", token: "test-token", cancel: true, occupy: true, logLevel: "INFO"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			_, manager := newTestServer(t, []redisproxy.Backend{{
+				Token:            "test-token",
+				ID:               "test",
+				ConnectionString: "redis://localhost:1",
+				MaxConnections:   1,
+			}}, &logs)
+			handler := NewHandler(manager, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: test.level})))
 
-	request := httptest.NewRequest(http.MethodGet, "/ping", nil)
-	response := httptest.NewRecorder()
+			if test.occupy {
+				_, release, err := manager.Acquire(context.Background(), "test-token")
 
-	handler.ServeHTTP(response, request)
+				if err != nil {
+					t.Fatal(err)
+				}
 
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("got %d %q, want unauthorized response", response.Code, response.Body.String())
-	}
+				defer release()
+				logs.Reset()
+			}
 
-	if response.Header().Get("X-Request-ID") != "" {
-		t.Fatalf("unexpected X-Request-ID response header")
-	}
+			request := httptest.NewRequest(test.method, test.path, nil)
 
-	var entry map[string]any
+			if test.token != "" {
+				request.Header.Set("Authorization", "Bearer "+test.token)
+			}
 
-	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
-		t.Fatal(err)
-	}
+			if test.cancel {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
 
-	if entry["msg"] != "request completed" || entry["request_id"] == "" || entry["method"] != http.MethodGet || entry["path"] != "/ping" || entry["status"] != float64(http.StatusUnauthorized) {
-		t.Fatalf("unexpected request log: %#v", entry)
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if test.status != 0 && response.Code != test.status {
+				t.Fatalf("got %d %q, want %d", response.Code, response.Body.String(), test.status)
+			}
+
+			if response.Header().Get("X-Request-ID") != "" {
+				t.Fatal("unexpected X-Request-ID response header")
+			}
+
+			if test.silent {
+				if logs.Len() != 0 {
+					t.Fatalf("successful probe logged at info: %s", logs.String())
+				}
+
+				return
+			}
+
+			var entry map[string]any
+
+			if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+				t.Fatal(err)
+			}
+
+			if entry["request_id"] == "" || entry["method"] != test.method || entry["path"] != test.path || entry["level"] != test.logLevel {
+				t.Fatalf("unexpected request log: %#v", entry)
+			}
+
+			if test.status == 0 {
+				if response.Body.Len() != 0 || entry["msg"] != "request canceled" || entry["canceled"] != true || entry["error"] != context.Canceled.Error() {
+					t.Fatalf("unexpected canceled request response/log: %q %#v", response.Body.String(), entry)
+				}
+
+				if _, exists := entry["status"]; exists {
+					t.Fatalf("canceled request logged an unwritten HTTP status: %#v", entry)
+				}
+			} else if entry["msg"] != "request completed" || entry["status"] != float64(test.status) {
+				t.Fatalf("unexpected completed request log: %#v", entry)
+			}
+		})
 	}
 }
 

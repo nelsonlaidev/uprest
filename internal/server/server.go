@@ -24,6 +24,7 @@ import (
 
 const maxBodySize = 10 << 20
 const commandTimeout = 30 * time.Second
+const readinessTimeout = 2 * time.Second
 const streamHeartbeatInterval = 15 * time.Second
 const streamWriteTimeout = 5 * time.Second
 const monitorStopTimeout = 5 * time.Second
@@ -79,24 +80,57 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		duration := time.Since(started)
 		status := response.status
-
-		if status == 0 {
-			status = http.StatusOK
-		}
-
-		h.logger.InfoContext(r.Context(), "request completed",
+		level := slog.LevelInfo
+		message := "request completed"
+		attributes := []any{
 			"request_id", requestID,
 			"method", r.Method,
 			"path", r.URL.Path,
-			"status", status,
-			"duration_ms", float64(duration.Microseconds())/1000,
-		)
+			"duration_ms", float64(duration.Microseconds()) / 1000,
+		}
+
+		if status == 0 && r.Context().Err() != nil {
+			message = "request canceled"
+			attributes = append(attributes, "canceled", true, "error", r.Context().Err().Error())
+		} else {
+			if status == 0 {
+				status = http.StatusOK
+			}
+
+			attributes = append(attributes, "status", status)
+
+			if status == http.StatusOK && (r.URL.Path == "/health" || r.URL.Path == "/ready") {
+				level = slog.LevelDebug
+			}
+		}
+
+		h.logger.Log(r.Context(), level, message, attributes...)
 	}()
 
 	h.serve(response, r)
 }
 
 func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+
+	if r.URL.Path == "/health" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+			return
+		}
+
+		if r.Context().Err() != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "shutting_down"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		return
+	}
+
 	token, ok := bearerToken(r)
 
 	if len(r.Header.Values("Authorization")) == 0 {
@@ -110,6 +144,17 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set(syncTokenHeader, newRequestID())
+
+	if r.URL.Path == "/ready" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+			return
+		}
+
+		h.serveReady(w, r, token)
+		return
+	}
 
 	monitor := monitorRoute(r.URL.Path)
 	patternSubscription, subscription := subscriptionRoute(r.URL.Path)
@@ -211,6 +256,37 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", allowedMethods(r.URL.Path))
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
 	}
+}
+
+func (h *apiHandler) serveReady(w http.ResponseWriter, r *http.Request, token string) {
+	if r.Context().Err() != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), readinessTimeout)
+
+	defer cancel()
+
+	client, release, err := h.pools.Acquire(ctx, token)
+	ready := false
+
+	if err == nil {
+		defer release()
+
+		pong, pingErr := client.Ping(ctx).Result()
+		ready = pingErr == nil && pong == "PONG" && ctx.Err() == nil
+	}
+
+	if r.Context().Err() != nil {
+		return
+	}
+
+	if !ready {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
 }
 
 func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client *redis.Client, release func()) {
@@ -660,7 +736,7 @@ func requestBody(w http.ResponseWriter, r *http.Request) io.Reader {
 }
 
 func reservedPath(path string) bool {
-	return path == "/" || path == "/pipeline" || path == "/multi-exec"
+	return path == "/" || path == "/pipeline" || path == "/multi-exec" || path == "/health" || path == "/ready"
 }
 
 func monitorRoute(path string) bool {
@@ -713,6 +789,10 @@ func unsupportedEndpoint(path string) bool {
 }
 
 func allowedMethods(path string) string {
+	if path == "/health" || path == "/ready" {
+		return http.MethodGet
+	}
+
 	if reservedPath(path) {
 		return http.MethodPost
 	}

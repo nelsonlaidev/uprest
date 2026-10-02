@@ -65,6 +65,10 @@ func TestManagerCreatesSeparateBoundedPools(t *testing.T) {
 		t.Fatalf("unexpected second pool limits: %+v", second.Options())
 	}
 
+	if !first.Options().ContextTimeoutEnabled || !second.Options().ContextTimeoutEnabled {
+		t.Fatal("shared Redis pools must respect context deadlines")
+	}
+
 	stats := manager.Stats()
 
 	if stats.Active != 2 || stats.Created != 2 || stats.Evicted != 0 {
@@ -136,6 +140,10 @@ func TestManagerSharesCapacityWithDedicatedClients(t *testing.T) {
 	// go-redis normalizes ReadTimeout=-1 to 0, meaning no socket read deadline.
 	if dedicated.Options().ReadTimeout != 0 {
 		t.Fatalf("got dedicated client read timeout %s, want disabled", dedicated.Options().ReadTimeout)
+	}
+
+	if dedicated.Options().ContextTimeoutEnabled {
+		t.Fatal("dedicated Redis client unexpectedly enabled context deadlines")
 	}
 
 	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
