@@ -318,7 +318,7 @@ func TestColdConnectionDeadline(t *testing.T) {
 }
 
 func TestHandlerRejectsUnauthorizedAndMalformedRequests(t *testing.T) {
-	handler, _ := newTestServer(t, []redisproxy.Backend{{
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
 		Token:            "test-token",
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
@@ -335,6 +335,7 @@ func TestHandlerRejectsUnauthorizedAndMalformedRequests(t *testing.T) {
 		want   string
 	}{
 		{"missing token", http.MethodPost, "/", "", `["PING"]`, http.StatusUnauthorized, `{"error":"Unauthorized"}`},
+		{"blocked command without token", http.MethodPost, "/", "", `["SELECT",1]`, http.StatusUnauthorized, `{"error":"Unauthorized"}`},
 		{"empty bearer token", http.MethodPost, "/", "Bearer ", `["PING"]`, http.StatusUnauthorized, `{"error":"Unauthorized"}`},
 		{"wrong token", http.MethodPost, "/", "Bearer wrong", `["PING"]`, http.StatusUnauthorized, `{"error":"Unauthorized"}`},
 		{"invalid body", http.MethodPost, "/", "Bearer test-token", `[]`, http.StatusBadRequest, `{"error":"Invalid command"}`},
@@ -366,6 +367,10 @@ func TestHandlerRejectsUnauthorizedAndMalformedRequests(t *testing.T) {
 				t.Fatalf("got %d %q, want %d %q", response.Code, response.Body.String(), test.status, test.want)
 			}
 		})
+	}
+
+	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
+		t.Fatalf("rejected requests created a Redis pool: %+v", stats)
 	}
 }
 
@@ -435,12 +440,53 @@ func TestQueryTokenAuthentication(t *testing.T) {
 	}
 }
 
+func TestRequestBodyLimit(t *testing.T) {
+	handler, manager := newTestServer(t, []redisproxy.Backend{{
+		Token: "test-token", ID: "offline", ConnectionString: "redis://localhost:1", MaxConnections: 1,
+	}}, io.Discard, "", nil)
+	value := strings.Repeat("x", maxBodySize+1)
+
+	for _, test := range []struct {
+		path    string
+		prefix  string
+		suffix  string
+		message string
+	}{
+		{"/", `["SET","key","`, `"]`, "Invalid command"},
+		{"/SET/key", "", "", "Invalid command"},
+		{"/pipeline", `[["SET","key","`, `"]]`, "Invalid pipeline"},
+		{"/multi-exec", `[["SET","key","`, `"]]`, "Invalid transaction"},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			body := io.MultiReader(strings.NewReader(test.prefix), strings.NewReader(value), strings.NewReader(test.suffix))
+			request := httptest.NewRequest(http.MethodPost, test.path, body)
+			request.Header.Set("Authorization", "Bearer test-token")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			var result map[string]string
+
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if response.Code != http.StatusBadRequest || result["error"] != test.message {
+				t.Fatalf("unexpected oversized body response: %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	if stats := manager.Stats(); stats.Active != 0 || stats.Created != 0 {
+		t.Fatalf("oversized bodies created a Redis pool: %+v", stats)
+	}
+}
+
 func TestRequestLogging(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		method   string
 		path     string
 		token    string
+		body     string
 		cancel   bool
 		occupy   bool
 		level    slog.Level
@@ -455,7 +501,7 @@ func TestRequestLogging(t *testing.T) {
 		{name: "unsupported health method visible at info", method: http.MethodPost, path: "/health", status: http.StatusMethodNotAllowed, logLevel: "INFO"},
 		{name: "shutdown health visible at info", method: http.MethodGet, path: "/health", cancel: true, status: http.StatusServiceUnavailable, logLevel: "INFO"},
 		{name: "canceled readiness without response", method: http.MethodGet, path: "/ready", token: "test-token", cancel: true, logLevel: "INFO"},
-		{name: "canceled command capacity wait", method: http.MethodPost, path: "/", token: "test-token", cancel: true, occupy: true, logLevel: "INFO"},
+		{name: "canceled command capacity wait", method: http.MethodPost, path: "/", token: "test-token", body: `["PING"]`, cancel: true, occupy: true, logLevel: "INFO"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var logs bytes.Buffer
@@ -478,7 +524,7 @@ func TestRequestLogging(t *testing.T) {
 				logs.Reset()
 			}
 
-			request := httptest.NewRequest(test.method, test.path, nil)
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
 
 			if test.token != "" {
 				request.Header.Set("Authorization", "Bearer "+test.token)

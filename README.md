@@ -123,6 +123,24 @@ Errors use `{"error":"..."}`. Validation and Redis command errors return `400`, 
 
 `/health` and `/ready` are reserved paths and return JSON status objects; send Redis commands with those names through `POST /`.
 
+### Shared connection isolation
+
+Ordinary body and path commands, pipelines, and transactions reject commands that can change a shared Redis connection's state:
+
+- Connection state: `AUTH`, `HELLO`, `SELECT`, `QUIT`, `RESET`, `READONLY`, `READWRITE`, `ASKING`.
+- Transaction state: `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`.
+- Streaming state: `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE`, `MONITOR`.
+- Replication and session protocols: `SYNC`, `PSYNC`, `REPLCONF`, all `HIMPORT` subcommands.
+- Script debugging: `SCRIPT DEBUG` in any mode.
+
+`CLIENT` permits only `GETNAME`, `GETREDIR`, `ID`, `INFO`, `LIST`, `TRACKINGINFO`, and `HELP`; missing or other subcommands are rejected. Matching is case-insensitive and does not inspect keys, values, or script contents. Redis still validates arguments for permitted commands.
+
+Configure Redis credentials and the database number in each backend's connection URL. Use `/multi-exec` for transactions and the dedicated `/subscribe`, `/psubscribe`, and `/monitor` routes for SSE streams. Previously forwarded stateful commands now return HTTP `400` with `{"error":"Command is not supported over HTTP"}`, including when RESP2 is requested.
+
+The complete request is decoded and validated before waiting for backend capacity or contacting Redis. If any command in a batch is prohibited, the entire batch is rejected without executing any commands or updating script aliases. Malformed requests retain their existing validation errors.
+
+All other commands retain existing forwarding behavior, including blocking commands, Lua scripting, `SCRIPT LOAD`/`EXISTS`, functions, and data cleanup commands such as `FLUSHDB`. This policy is always enabled and assumes standard Redis command names; it does not sandbox scripts or module-defined commands. Redis ACLs remain responsible for authorization.
+
 ### Metrics
 
 Set `UPREST_METRICS_TOKEN` to enable authenticated Prometheus metrics on the same HTTP port. The monitoring token must differ from every backend token, and backend IDs must be unique when metrics are enabled. Invalid configuration prevents startup without printing tokens. An unset or empty value disables metrics, including collection, and preserves `/metrics` as an ordinary Redis path command. The bundled Compose example keeps metrics disabled.

@@ -13,6 +13,54 @@ import (
 var ErrInvalidCommand = errors.New("command must be a JSON array beginning with a command name and containing only scalar arguments")
 var ErrInvalidPipeline = errors.New("pipeline must be a non-empty JSON array of commands")
 var ErrInvalidPathCommand = errors.New("path must contain a command and valid URL-encoded arguments")
+var ErrUnsupportedCommand = errors.New("Command is not supported over HTTP") //nolint:staticcheck // ST1005: external HTTP API message.
+
+// ValidateCommand rejects decoded commands that can change a shared connection's state.
+func ValidateCommand(command []any) error {
+	if len(command) == 0 {
+		return ErrInvalidCommand
+	}
+
+	name, ok := command[0].(string)
+
+	if !ok || name == "" {
+		return ErrInvalidCommand
+	}
+
+	var subcommand string
+
+	if len(command) > 1 {
+		switch value := command[1].(type) {
+		case string:
+			subcommand = value
+		case []byte:
+			subcommand = string(value)
+		}
+	}
+
+	switch strings.ToUpper(name) {
+	case "AUTH", "HELLO", "SELECT", "QUIT", "RESET", "READONLY", "READWRITE", "ASKING",
+		"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
+		"SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE", "MONITOR",
+		"SYNC", "PSYNC", "REPLCONF", "HIMPORT":
+		return ErrUnsupportedCommand
+
+	case "CLIENT":
+		switch strings.ToUpper(subcommand) {
+		case "GETNAME", "GETREDIR", "ID", "INFO", "LIST", "TRACKINGINFO", "HELP":
+			return nil
+		}
+
+		return ErrUnsupportedCommand
+
+	case "SCRIPT":
+		if strings.EqualFold(subcommand, "DEBUG") {
+			return ErrUnsupportedCommand
+		}
+	}
+
+	return nil
+}
 
 func DecodeCommand(body io.Reader) ([]any, error) {
 	decoder := json.NewDecoder(body)

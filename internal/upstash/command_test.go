@@ -1,10 +1,104 @@
 package upstash
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestValidateCommandRejectsConnectionStateChanges(t *testing.T) {
+	for _, name := range []string{
+		"AUTH", "HELLO", "SELECT", "QUIT", "RESET", "READONLY", "READWRITE", "ASKING",
+		"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
+		"SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE", "MONITOR",
+		"SYNC", "PSYNC", "REPLCONF", "HIMPORT",
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, spelling := range []string{name, strings.ToLower(name)} {
+				command := []any{spelling, "private argument"}
+
+				if err := ValidateCommand(command); !errors.Is(err, ErrUnsupportedCommand) {
+					t.Fatalf("got %v for %q, want unsupported command", err, spelling)
+				}
+
+				if !reflect.DeepEqual(command, []any{spelling, "private argument"}) {
+					t.Fatalf("validation changed command: %#v", command)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateCommand(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		command   []any
+		wantError error
+	}{
+		{"empty command", nil, ErrInvalidCommand},
+		{"empty name", []any{""}, ErrInvalidCommand},
+		{"non-string name", []any{1}, ErrInvalidCommand},
+		{"missing CLIENT subcommand", []any{"CLIENT"}, ErrUnsupportedCommand},
+		{"empty CLIENT subcommand", []any{"CLIENT", ""}, ErrUnsupportedCommand},
+		{"non-string CLIENT subcommand", []any{"CLIENT", 1}, ErrUnsupportedCommand},
+		{"unknown CLIENT subcommand", []any{"CLIENT", "FUTURE"}, ErrUnsupportedCommand},
+		{"CLIENT REPLY", []any{"cLiEnT", "rEpLy", "OFF"}, ErrUnsupportedCommand},
+		{"CLIENT TRACKING", []any{"CLIENT", "TRACKING", "ON"}, ErrUnsupportedCommand},
+		{"CLIENT SETNAME", []any{"CLIENT", "SETNAME", "name"}, ErrUnsupportedCommand},
+		{"CLIENT SETINFO", []any{"CLIENT", "SETINFO", "LIB-NAME", "name"}, ErrUnsupportedCommand},
+		{"CLIENT KILL", []any{"CLIENT", "KILL", "ID", "1"}, ErrUnsupportedCommand},
+		{"CLIENT PAUSE", []any{"CLIENT", "PAUSE", "1"}, ErrUnsupportedCommand},
+		{"CLIENT body subcommand", []any{"CLIENT", []byte("rEpLy"), "OFF"}, ErrUnsupportedCommand},
+		{"SCRIPT DEBUG YES", []any{"SCRIPT", "DEBUG", "YES"}, ErrUnsupportedCommand},
+		{"SCRIPT DEBUG NO", []any{"sCrIpT", "dEbUg", "NO"}, ErrUnsupportedCommand},
+		{"SCRIPT DEBUG SYNC", []any{"SCRIPT", "DEBUG", "SYNC"}, ErrUnsupportedCommand},
+		{"SCRIPT DEBUG missing mode", []any{"SCRIPT", "DEBUG"}, ErrUnsupportedCommand},
+		{"SCRIPT DEBUG body subcommand", []any{"SCRIPT", []byte("dEbUg"), "YES"}, ErrUnsupportedCommand},
+		{"PING", []any{"PING"}, nil},
+		{"ECHO", []any{"ECHO", "AUTH"}, nil},
+		{"command word as key", []any{"GET", "SELECT"}, nil},
+		{"command word as value", []any{"SET", "key", "CLIENT REPLY OFF"}, nil},
+		{"Lua contents", []any{"EVAL", "return 'MONITOR'", "0"}, nil},
+		{"read-only Lua", []any{"EVAL_RO", "return 'SELECT'", "0"}, nil},
+		{"EVALSHA", []any{"EVALSHA", "hash", "0"}, nil},
+		{"EVALSHA_RO", []any{"EVALSHA_RO", "hash", "0"}, nil},
+		{"FCALL", []any{"FCALL", "name", "0"}, nil},
+		{"FCALL_RO", []any{"FCALL_RO", "name", "0"}, nil},
+		{"SCRIPT LOAD", []any{"SCRIPT", "LOAD", "return 'DEBUG'"}, nil},
+		{"SCRIPT EXISTS", []any{"SCRIPT", "EXISTS", "hash"}, nil},
+		{"missing SCRIPT subcommand", []any{"SCRIPT"}, nil},
+		{"non-string SCRIPT subcommand", []any{"SCRIPT", 1}, nil},
+		{"PUBLISH", []any{"PUBLISH", "channel", "SUBSCRIBE"}, nil},
+		{"PUBSUB", []any{"PUBSUB", "CHANNELS"}, nil},
+		{"blocking command", []any{"BLPOP", "key", "0"}, nil},
+		{"blocking stream", []any{"XREAD", "BLOCK", "0", "STREAMS", "key", "$"}, nil},
+		{"cleanup", []any{"FLUSHDB"}, nil},
+		{"administration", []any{"CONFIG", "GET", "timeout"}, nil},
+		{"unknown command", []any{"FUTURE.COMMAND", "AUTH"}, nil},
+		{"CLIENT query body subcommand", []any{"CLIENT", []byte("gEtNaMe")}, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := append([]any(nil), test.command...)
+
+			if err := ValidateCommand(test.command); !errors.Is(err, test.wantError) {
+				t.Fatalf("got %v, want %v", err, test.wantError)
+			}
+
+			if !reflect.DeepEqual(test.command, before) {
+				t.Fatalf("validation changed command: %#v", test.command)
+			}
+		})
+	}
+
+	for _, subcommand := range []string{"GETNAME", "GETREDIR", "ID", "INFO", "LIST", "TRACKINGINFO", "HELP"} {
+		t.Run("CLIENT "+subcommand, func(t *testing.T) {
+			if err := ValidateCommand([]any{"cLiEnT", strings.ToLower(subcommand)}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestDecodeCommand(t *testing.T) {
 	tests := []struct {

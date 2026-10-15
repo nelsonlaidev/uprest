@@ -229,6 +229,7 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	monitor := monitorRoute(r.URL.Path)
 	patternSubscription, subscription := subscriptionRoute(r.URL.Path)
 	var subscriptionNames []string
+	var commands [][]any
 	var resp2Response bool
 	var err error
 
@@ -268,6 +269,48 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
+		}
+
+		message := "Invalid command"
+
+		switch r.URL.Path {
+		case "/":
+			var command []any
+			command, err = upstash.DecodeCommand(requestBody(w, r))
+			commands = [][]any{command}
+
+		case "/pipeline", "/multi-exec":
+			commands, err = upstash.DecodePipeline(requestBody(w, r))
+			message = "Invalid pipeline"
+
+			if r.URL.Path == "/multi-exec" {
+				message = "Invalid transaction"
+			}
+
+		default:
+			var body []byte
+
+			if r.Method == http.MethodPost {
+				body, err = io.ReadAll(requestBody(w, r))
+			}
+
+			if err == nil {
+				var command []any
+				command, err = upstash.DecodePathCommand(r.URL.EscapedPath(), r.URL.RawQuery, body)
+				commands = [][]any{command}
+			}
+		}
+
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": message})
+			return
+		}
+
+		for _, command := range commands {
+			if err := upstash.ValidateCommand(command); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
 		}
 	}
 
@@ -311,22 +354,15 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/":
-		h.serveBodyCommand(w, r, client, resp2Response)
+	switch r.URL.Path {
+	case "/pipeline":
+		h.serveBatch(w, r, client, commands, false, resp2Response)
 
-	case r.Method == http.MethodPost && r.URL.Path == "/pipeline":
-		h.serveBatch(w, r, client, false, resp2Response)
-
-	case r.Method == http.MethodPost && r.URL.Path == "/multi-exec":
-		h.serveBatch(w, r, client, true, false)
-
-	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && !reservedPath(r.URL.Path, h.metricsHandler != nil):
-		h.servePathCommand(w, r, client, resp2Response)
+	case "/multi-exec":
+		h.serveBatch(w, r, client, commands, true, false)
 
 	default:
-		w.Header().Set("Allow", allowedMethods(r.URL.Path, h.metricsHandler != nil))
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+		h.executeCommand(w, r, client, commands[0], resp2Response)
 	}
 }
 
@@ -591,40 +627,6 @@ func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, c
 	}
 }
 
-func (h *apiHandler) serveBodyCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, resp2Response bool) {
-	command, err := upstash.DecodeCommand(requestBody(w, r))
-
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid command"})
-		return
-	}
-
-	h.executeCommand(w, r, client, command, resp2Response)
-}
-
-func (h *apiHandler) servePathCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, resp2Response bool) {
-	var body []byte
-
-	if r.Method == http.MethodPost {
-		var err error
-		body, err = io.ReadAll(requestBody(w, r))
-
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid command"})
-			return
-		}
-	}
-
-	command, err := upstash.DecodePathCommand(r.URL.EscapedPath(), r.URL.RawQuery, body)
-
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid command"})
-		return
-	}
-
-	h.executeCommand(w, r, client, command, resp2Response)
-}
-
 func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, command []any, resp2Response bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.commandTimeout)
 
@@ -656,20 +658,7 @@ func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, clie
 	writeJSON(w, status, response)
 }
 
-func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *redis.Client, transaction bool, resp2Response bool) {
-	commands, err := upstash.DecodePipeline(requestBody(w, r))
-
-	if err != nil {
-		message := "Invalid pipeline"
-
-		if transaction {
-			message = "Invalid transaction"
-		}
-
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": message})
-		return
-	}
-
+func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *redis.Client, commands [][]any, transaction bool, resp2Response bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.commandTimeout)
 
 	defer cancel()
@@ -721,7 +710,7 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 		results[i] = pipeline.Do(ctx, command...)
 	}
 
-	_, err = pipeline.Exec(ctx)
+	_, err := pipeline.Exec(ctx)
 
 	var redisError redis.Error
 

@@ -310,7 +310,9 @@ func TestCapacityTimeout(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			response = httptest.NewRecorder()
-			handler.ServeHTTP(response, request.WithContext(ctx))
+			canceledRequest := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body)).WithContext(ctx)
+			canceledRequest.Header = request.Header.Clone()
+			handler.ServeHTTP(response, canceledRequest)
 
 			if response.Body.Len() != 0 {
 				t.Fatalf("canceled capacity wait wrote a response: %q", response.Body.String())
