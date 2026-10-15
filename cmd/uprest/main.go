@@ -72,13 +72,13 @@ func run() error {
 
 	httpServer := &http.Server{
 		Addr:    address,
-		Handler: server.NewHandler(pools, logger, cfg.MetricsToken, registry),
+		Handler: server.NewHandler(pools, logger, cfg.MetricsToken, registry, cfg.AcquireTimeout, cfg.CommandTimeout),
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      50 * time.Second,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -87,6 +87,9 @@ func run() error {
 		"mode", cfg.Mode,
 		"backends", len(cfg.Backends),
 		"idle_timeout", cfg.IdleTimeout,
+		"acquire_timeout", cfg.AcquireTimeout,
+		"command_timeout", cfg.CommandTimeout,
+		"http_write_timeout", cfg.HTTPWriteTimeout,
 	)
 
 	serveErr := make(chan error, 1)

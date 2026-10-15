@@ -60,6 +60,8 @@ Uprest reads `UPREST_*` environment variables. `UPREST_MODE` selects a single ba
 | `UPREST_PORT`              | `80` (`8080` in the image)       | HTTP listen port                                      |
 | `UPREST_IPV6`              | `false`                          | Listen on IPv6                                        |
 | `UPREST_IDLE_TIMEOUT`      | `15m`                            | Time before an idle Redis pool closes                 |
+| `UPREST_ACQUIRE_TIMEOUT`   | `30s`                            | Maximum wait for backend capacity                     |
+| `UPREST_COMMAND_TIMEOUT`   | `30s`                            | Maximum execution time for a command or batch          |
 | `UPREST_LOG_LEVEL`         | `info`                           | JSON log level: `debug`, `info`, `warn`, or `error`   |
 | `UPREST_METRICS_TOKEN`     | Empty (disabled)                 | Dedicated Bearer token for `GET /metrics`            |
 
@@ -78,6 +80,18 @@ Set `UPREST_MODE=file` and mount a JSON file at `/app/uprest-config/tokens.json`
 ```
 
 Each token selects its backend; `max_connections` is optional and defaults to `3`. `UPREST_TOKEN` and `UPREST_CONNECTION_STRING` are ignored in file mode.
+
+### Timeouts
+
+`UPREST_ACQUIRE_TIMEOUT` and `UPREST_COMMAND_TIMEOUT` apply process-wide in both modes. Use positive Go durations such as `250ms`, `5s`, or `2m`. Unset or empty values default to `30s`; invalid, zero, negative, or overflowing durations prevent startup. Configurations that overflow the combined HTTP response timeout also prevent startup.
+
+Capacity acquisition and execution have independent budgets. Acquisition starts before waiting for a backend slot and applies to ordinary commands, Pub/Sub, and MONITOR. Command execution starts after command/body decoding, and each pipeline or transaction shares one execution budget across the entire batch. Acquisition timeout returns JSON `503`; execution timeout returns JSON `502`, including for RESP2 requests.
+
+The command timeout is an upper bound. Earlier caller deadlines and shorter Redis connection or socket timeouts still apply, including go-redis's default five-second socket read/write limits and settings in the Redis URL. Increasing `UPREST_COMMAND_TIMEOUT` does not override those limits. Client cancellation does not immediately interrupt an in-flight socket read.
+
+`/ready` retains its shared two-second acquisition-and-PING budget. Pub/Sub and MONITOR retain their existing 30-second initialization limits; the command timeout does not limit established SSE streams.
+
+The HTTP response write timeout is automatically calculated as `max(50s, 15s + acquire timeout + max(command timeout, 30s) + 5s)`, giving a default of `80s`. The extra time accommodates the existing request-read limit, stream initialization, and writing the final response. The effective acquisition, command, and HTTP write timeouts appear in the startup log.
 
 ## API
 

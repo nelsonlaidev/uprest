@@ -164,15 +164,27 @@ func TestHealthShutdownAndReadyCancellation(t *testing.T) {
 	}
 }
 
-func TestReadyColdConnectionDeadline(t *testing.T) {
+func TestColdConnectionDeadline(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		wait   bool
-		cancel bool
+		name           string
+		wait           bool
+		cancel         bool
+		path           string
+		body           string
+		format         string
+		callerDeadline bool
 	}{
-		{name: "stalled handshake"},
-		{name: "capacity and handshake share deadline", wait: true},
-		{name: "cancel during handshake", cancel: true},
+		{name: "ready stalled handshake", path: "/ready"},
+		{name: "ready capacity and handshake share deadline", path: "/ready", wait: true},
+		{name: "ready cancel during handshake", path: "/ready", cancel: true},
+		{name: "JSON command", path: "/", body: `["PING"]`},
+		{name: "RESP2 command", path: "/", body: `["PING"]`, format: "resp2"},
+		{name: "path command", path: "/PING"},
+		{name: "JSON pipeline", path: "/pipeline", body: `[["PING"],["PING"]]`},
+		{name: "RESP2 pipeline", path: "/pipeline", body: `[["PING"],["PING"]]`, format: "resp2"},
+		{name: "transaction", path: "/multi-exec", body: `[["PING"],["PING"]]`},
+		{name: "independent acquisition and execution", path: "/", body: `["PING"]`, wait: true},
+		{name: "earlier caller deadline", path: "/", body: `["PING"]`, callerDeadline: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -199,12 +211,21 @@ func TestReadyColdConnectionDeadline(t *testing.T) {
 				_, _ = io.Copy(io.Discard, connection)
 			}()
 
-			handler, manager := newTestServer(t, []redisproxy.Backend{{
+			_, manager := newTestServer(t, []redisproxy.Backend{{
 				Token:            "test-token",
 				ID:               "test",
 				ConnectionString: "redis://" + listener.Addr().String(),
 				MaxConnections:   1,
 			}}, io.Discard, "", nil)
+			handler := NewHandler(manager, slog.New(slog.NewTextHandler(io.Discard, nil)), "", nil, time.Second, 200*time.Millisecond)
+			timeout := 200 * time.Millisecond
+			wait := 300 * time.Millisecond
+
+			if test.path == "/ready" {
+				timeout = readinessTimeout
+				wait = time.Second
+				handler = NewHandler(manager, nil, "", nil, 20*time.Millisecond, 20*time.Millisecond)
+			}
 
 			if test.wait {
 				_, release, acquireErr := manager.Acquire(context.Background(), "test-token")
@@ -215,12 +236,18 @@ func TestReadyColdConnectionDeadline(t *testing.T) {
 
 				defer release()
 
-				timer := time.AfterFunc(time.Second, release)
+				timer := time.AfterFunc(wait, release)
 
 				defer timer.Stop()
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
+
+			if test.callerDeadline {
+				cancel()
+				timeout = 50 * time.Millisecond
+				ctx, cancel = context.WithTimeout(context.Background(), timeout)
+			}
 
 			defer cancel()
 
@@ -234,23 +261,45 @@ func TestReadyColdConnectionDeadline(t *testing.T) {
 				}()
 			}
 
-			request := httptest.NewRequest(http.MethodGet, "/ready", nil).WithContext(ctx)
+			method := http.MethodGet
+
+			if test.body != "" {
+				method = http.MethodPost
+			}
+
+			request := httptest.NewRequest(method, test.path, strings.NewReader(test.body)).WithContext(ctx)
 			request.Header.Set("Authorization", "Bearer test-token")
+			request.Header.Set(responseFormatHeader, test.format)
 			response := httptest.NewRecorder()
 			started := time.Now()
+			wantDuration := timeout
+
+			if test.wait && test.path != "/ready" {
+				wantDuration += wait
+			}
 
 			handler.ServeHTTP(response, request)
 
-			if elapsed := time.Since(started); (!test.cancel && elapsed < readinessTimeout-100*time.Millisecond) || elapsed > readinessTimeout+2*time.Second {
-				t.Fatalf("cold connection probe took %s, want approximately %s", elapsed, readinessTimeout)
+			if elapsed := time.Since(started); (!test.cancel && elapsed < wantDuration-30*time.Millisecond) || elapsed > wantDuration+2*time.Second {
+				t.Fatalf("cold connection request took %s, want approximately %s", elapsed, wantDuration)
 			}
 
 			if test.cancel {
 				if response.Body.Len() != 0 {
 					t.Fatalf("canceled probe wrote a response: %q", response.Body.String())
 				}
-			} else if response.Code != http.StatusServiceUnavailable || strings.TrimSpace(response.Body.String()) != `{"status":"not_ready"}` {
-				t.Fatalf("unexpected stalled probe response: %d %q", response.Code, response.Body.String())
+			} else {
+				status := http.StatusBadGateway
+				body := `{"error":"Redis unavailable"}`
+
+				if test.path == "/ready" {
+					status = http.StatusServiceUnavailable
+					body = `{"status":"not_ready"}`
+				}
+
+				if response.Code != status || strings.TrimSpace(response.Body.String()) != body || response.Header().Get("Content-Type") != "application/json" {
+					t.Fatalf("unexpected stalled response: %d %q", response.Code, response.Body.String())
+				}
 			}
 
 			leaseCtx, stop := context.WithTimeout(context.Background(), time.Second)
@@ -416,7 +465,7 @@ func TestRequestLogging(t *testing.T) {
 				ConnectionString: "redis://localhost:1",
 				MaxConnections:   1,
 			}}, &logs, "", nil)
-			handler := NewHandler(manager, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: test.level})), "", nil)
+			handler := NewHandler(manager, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: test.level})), "", nil, 30*time.Second, 30*time.Second)
 
 			if test.occupy {
 				_, release, err := manager.Acquire(context.Background(), "test-token")
@@ -962,5 +1011,5 @@ func newTestServer(t *testing.T, backends []redisproxy.Backend, logOutput io.Wri
 		}
 	})
 
-	return NewHandler(manager, logger, metricsToken, registry), manager
+	return NewHandler(manager, logger, metricsToken, registry, 30*time.Second, 30*time.Second), manager
 }

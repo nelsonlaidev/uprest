@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -19,14 +20,17 @@ const defaultIdleTimeout = 15 * time.Minute
 const defaultTokensFile = "/app/uprest-config/tokens.json" //nolint:gosec // G101: file path, not a credential
 
 type Config struct {
-	Mode         string
-	Backends     []redisproxy.Backend
-	TokensFile   string
-	Port         int
-	IPv6         bool
-	IdleTimeout  time.Duration
-	LogLevel     slog.Level
-	MetricsToken string
+	Mode             string
+	Backends         []redisproxy.Backend
+	TokensFile       string
+	Port             int
+	IPv6             bool
+	IdleTimeout      time.Duration
+	AcquireTimeout   time.Duration
+	CommandTimeout   time.Duration
+	HTTPWriteTimeout time.Duration
+	LogLevel         slog.Level
+	MetricsToken     string
 }
 
 type fileBackend struct {
@@ -43,11 +47,13 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Mode:         mode,
-		Port:         defaultPort,
-		IdleTimeout:  defaultIdleTimeout,
-		LogLevel:     slog.LevelInfo,
-		MetricsToken: os.Getenv("UPREST_METRICS_TOKEN"),
+		Mode:           mode,
+		Port:           defaultPort,
+		IdleTimeout:    defaultIdleTimeout,
+		AcquireTimeout: 30 * time.Second,
+		CommandTimeout: 30 * time.Second,
+		LogLevel:       slog.LevelInfo,
+		MetricsToken:   os.Getenv("UPREST_METRICS_TOKEN"),
 	}
 
 	if value := os.Getenv("UPREST_PORT"); value != "" {
@@ -70,15 +76,39 @@ func Load() (Config, error) {
 		cfg.IPv6 = ipv6
 	}
 
-	if value := os.Getenv("UPREST_IDLE_TIMEOUT"); value != "" {
-		idleTimeout, err := time.ParseDuration(value)
+	for _, setting := range []struct {
+		name     string
+		duration *time.Duration
+	}{
+		{"UPREST_IDLE_TIMEOUT", &cfg.IdleTimeout},
+		{"UPREST_ACQUIRE_TIMEOUT", &cfg.AcquireTimeout},
+		{"UPREST_COMMAND_TIMEOUT", &cfg.CommandTimeout},
+	} {
+		value := os.Getenv(setting.name)
 
-		if err != nil || idleTimeout <= 0 {
-			return Config{}, fmt.Errorf("UPREST_IDLE_TIMEOUT must be a positive duration")
+		if value == "" {
+			continue
 		}
 
-		cfg.IdleTimeout = idleTimeout
+		duration, err := time.ParseDuration(value)
+
+		if err != nil || duration <= 0 {
+			return Config{}, fmt.Errorf("%s must be a positive duration", setting.name)
+		}
+
+		*setting.duration = duration
 	}
+
+	// Allow the request read budget, acquisition, execution or stream initialization,
+	// and a final response write without overflowing time.Duration.
+	executionTimeout := max(cfg.CommandTimeout, 30*time.Second)
+	const httpOverhead = 15*time.Second + 5*time.Second
+
+	if cfg.AcquireTimeout > math.MaxInt64-httpOverhead-executionTimeout {
+		return Config{}, fmt.Errorf("UPREST_ACQUIRE_TIMEOUT and UPREST_COMMAND_TIMEOUT exceed the HTTP response timeout budget")
+	}
+
+	cfg.HTTPWriteTimeout = max(50*time.Second, httpOverhead+cfg.AcquireTimeout+executionTimeout)
 
 	if value := os.Getenv("UPREST_LOG_LEVEL"); value != "" {
 		switch strings.ToLower(value) {

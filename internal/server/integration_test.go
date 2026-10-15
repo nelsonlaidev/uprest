@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/nelsonlaidev/uprest/internal/config"
 	"github.com/nelsonlaidev/uprest/internal/redisproxy"
 )
 
@@ -40,6 +41,8 @@ func TestStreamMetricsWithRedis(t *testing.T) {
 			handler, _ := newTestServer(t, []redisproxy.Backend{{
 				Token: "test-token", ID: "integration", ConnectionString: redisIntegrationURL(t), MaxConnections: 1,
 			}}, io.Discard, "metrics-secret", registry)
+			handler.(*apiHandler).acquireTimeout = time.Second
+			handler.(*apiHandler).commandTimeout = time.Nanosecond
 			finished := make(chan struct{})
 			httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				handler.ServeHTTP(w, r)
@@ -158,6 +161,172 @@ func TestFailedStreamMetricsWithRedis(t *testing.T) {
 						}
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestCommandTimeoutWithRedis(t *testing.T) {
+	connectionString := redisIntegrationURL(t)
+	control := redisIntegrationClient(t)
+
+	for _, test := range []struct {
+		name          string
+		path          string
+		format        string
+		socketTimeout bool
+		capacity      bool
+	}{
+		{name: "JSON command", path: "/"},
+		{name: "RESP2 command", path: "/", format: "resp2"},
+		{name: "JSON pipeline", path: "/pipeline"},
+		{name: "RESP2 pipeline", path: "/pipeline", format: "resp2"},
+		{name: "transaction", path: "/multi-exec"},
+		{name: "shorter socket timeout", path: "/", socketTimeout: true},
+		{name: "capacity timeout", path: "/", format: "resp2", capacity: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backendURL, err := url.Parse(connectionString)
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			timeout := 200 * time.Millisecond
+			commandTimeout := timeout
+
+			if test.path == "/pipeline" {
+				timeout = 350 * time.Millisecond
+				commandTimeout = timeout
+			}
+
+			if test.socketTimeout {
+				query := backendURL.Query()
+				query.Set("read_timeout", "50ms")
+				backendURL.RawQuery = query.Encode()
+				timeout = 50 * time.Millisecond
+				commandTimeout = time.Second
+			}
+
+			t.Setenv("UPREST_MODE", "env")
+			t.Setenv("UPREST_TOKEN", "test-token")
+			t.Setenv("UPREST_CONNECTION_STRING", backendURL.String())
+			t.Setenv("UPREST_MAX_CONNECTIONS", "1")
+			t.Setenv("UPREST_METRICS_TOKEN", "")
+			t.Setenv("UPREST_ACQUIRE_TIMEOUT", "80ms")
+			t.Setenv("UPREST_COMMAND_TIMEOUT", commandTimeout.String())
+			cfg, err := config.Load()
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, manager := newTestServer(t, cfg.Backends, io.Discard, "", nil)
+			handler := NewHandler(manager, nil, "", nil, cfg.AcquireTimeout, cfg.CommandTimeout)
+			httpServer := httptest.NewUnstartedServer(handler)
+			httpServer.Config.WriteTimeout = cfg.HTTPWriteTimeout
+			httpServer.Start()
+
+			t.Cleanup(httpServer.Close)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+			defer cancel()
+
+			client, release, err := manager.Acquire(ctx, "test-token")
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer release()
+
+			// Warm the connection so execution tests wait for a command response.
+			if err := client.Ping(ctx).Err(); err != nil {
+				t.Fatal(err)
+			}
+
+			body := `["PING"]`
+
+			if test.path != "/" {
+				body = `[["PING"],["PING"]]`
+			}
+
+			if test.path == "/pipeline" {
+				// Each blocking command fits the budget, but their combined wait does not.
+				key := fmt.Sprintf("uprest:timeout:%d", time.Now().UnixNano())
+				body = fmt.Sprintf(`[["BLPOP",%q,0.2],["BLPOP",%q,0.2]]`, key, key)
+			}
+
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+test.path, strings.NewReader(body))
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			request.Header.Set("Authorization", "Bearer test-token")
+			request.Header.Set(responseFormatHeader, test.format)
+
+			if test.capacity {
+				timeout = cfg.AcquireTimeout
+			} else {
+				release()
+
+				if test.path != "/pipeline" {
+					// Pause only the isolated test backend; no DEBUG permission is required.
+					if err := control.ClientPause(ctx, 500*time.Millisecond).Err(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			started := time.Now()
+			response, err := httpServer.Client().Do(request)
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer func() { _ = response.Body.Close() }()
+
+			responseBody, err := io.ReadAll(response.Body)
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if elapsed := time.Since(started); elapsed < timeout-30*time.Millisecond || elapsed > timeout+2*time.Second {
+				t.Fatalf("request took %s, want approximately %s", elapsed, timeout)
+			}
+
+			status := http.StatusBadGateway
+			want := `{"error":"Redis unavailable"}`
+
+			if test.capacity {
+				status = http.StatusServiceUnavailable
+				want = `{"error":"Service Unavailable"}`
+			}
+
+			if response.StatusCode != status || response.Header.Get("Content-Type") != "application/json" || strings.TrimSpace(string(responseBody)) != want {
+				t.Fatalf("unexpected timeout response: %d %q", response.StatusCode, responseBody)
+			}
+
+			release()
+			client, release, err = manager.Acquire(ctx, "test-token")
+
+			if err != nil {
+				t.Fatalf("request timeout leaked capacity: %v", err)
+			}
+
+			defer release()
+
+			// Wait for the pause to end before checking socket and pool recovery.
+			if err := control.Ping(ctx).Err(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := client.Ping(ctx).Err(); err != nil {
+				t.Fatalf("pool did not recover after timeout: %v", err)
 			}
 		})
 	}

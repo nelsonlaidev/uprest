@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -254,6 +255,84 @@ func TestFailedStreamsDoNotIncreaseMetrics(t *testing.T) {
 		if family.GetName() == "uprest_streams_active" {
 			t.Fatal("failed stream initialization created an active stream metric")
 		}
+	}
+}
+
+func TestCapacityTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{"command", "/", `["PING"]`},
+		{"path command", "/PING", ""},
+		{"pipeline", "/pipeline", `[["PING"]]`},
+		{"transaction", "/multi-exec", `[["PING"]]`},
+		{"subscribe", "/subscribe/test", ""},
+		{"psubscribe", "/psubscribe/test*", ""},
+		{"monitor", "/monitor", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			handler, manager := newTestServer(t, []redisproxy.Backend{{
+				Token: "backend-secret", ID: "offline", ConnectionString: "redis://localhost:1", MaxConnections: 1,
+			}}, io.Discard, "metrics-secret", registry)
+			handler.(*apiHandler).acquireTimeout = 80 * time.Millisecond
+			_, release, err := manager.Acquire(context.Background(), "backend-secret")
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer release()
+
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			request.Header.Set("Authorization", "Bearer backend-secret")
+			request.Header.Set(responseFormatHeader, "resp2")
+			response := httptest.NewRecorder()
+			started := time.Now()
+			handler.ServeHTTP(response, request)
+
+			if elapsed := time.Since(started); elapsed < 60*time.Millisecond || elapsed > time.Second {
+				t.Fatalf("capacity timeout took %s, want approximately 80ms", elapsed)
+			}
+
+			if response.Code != http.StatusServiceUnavailable || response.Header().Get("Content-Type") != "application/json" || strings.TrimSpace(response.Body.String()) != `{"error":"Service Unavailable"}` {
+				t.Fatalf("unexpected capacity timeout response: %d %q", response.Code, response.Body.String())
+			}
+
+			sample := metricSample(t, registry, "uprest_redis_acquire_duration_seconds", map[string]string{"backend_id": "offline", "outcome": "timeout"})
+
+			if sample.Histogram.GetSampleCount() != 1 {
+				t.Fatalf("unexpected timeout observations: %d", sample.Histogram.GetSampleCount())
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			response = httptest.NewRecorder()
+			handler.ServeHTTP(response, request.WithContext(ctx))
+
+			if response.Body.Len() != 0 {
+				t.Fatalf("canceled capacity wait wrote a response: %q", response.Body.String())
+			}
+
+			release()
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+
+			defer cancel()
+
+			_, recovered, err := manager.Acquire(ctx, "backend-secret")
+
+			if err != nil {
+				t.Fatalf("capacity did not recover: %v", err)
+			}
+
+			recovered()
+
+			if metricSample(t, registry, "uprest_redis_capacity_in_use", map[string]string{"backend_id": "offline"}).Gauge.GetValue() != 0 {
+				t.Fatal("capacity remained occupied after recovery")
+			}
+		})
 	}
 }
 

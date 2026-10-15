@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -152,6 +153,77 @@ func TestMetricsConfiguration(t *testing.T) {
 	}
 }
 
+func TestTimeoutConfiguration(t *testing.T) {
+	for _, mode := range []string{"env", "file"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, test := range []struct {
+				name        string
+				acquire     string
+				command     string
+				wantAcquire time.Duration
+				wantCommand time.Duration
+				wantHTTP    time.Duration
+				wantError   string
+			}{
+				{name: "defaults", wantAcquire: 30 * time.Second, wantCommand: 30 * time.Second, wantHTTP: 80 * time.Second},
+				{name: "acquisition override", acquire: "250ms", wantAcquire: 250 * time.Millisecond, wantCommand: 30 * time.Second, wantHTTP: 50*time.Second + 250*time.Millisecond},
+				{name: "command override", command: "2m", wantAcquire: 30 * time.Second, wantCommand: 2 * time.Minute, wantHTTP: 170 * time.Second},
+				{name: "stream initialization budget", acquire: "1s", command: "2s", wantAcquire: time.Second, wantCommand: 2 * time.Second, wantHTTP: 51 * time.Second},
+				{name: "maximum HTTP budget", acquire: (time.Duration(math.MaxInt64) - 50*time.Second).String(), wantAcquire: time.Duration(math.MaxInt64) - 50*time.Second, wantCommand: 30 * time.Second, wantHTTP: math.MaxInt64},
+				{name: "acquisition budget overflow", acquire: (time.Duration(math.MaxInt64) - 50*time.Second + 1).String(), wantError: "HTTP response timeout budget"},
+				{name: "command budget overflow", command: time.Duration(math.MaxInt64).String(), wantError: "HTTP response timeout budget"},
+				{name: "combined budget overflow", acquire: "2000000h", command: "2000000h", wantError: "HTTP response timeout budget"},
+				{name: "malformed acquisition", acquire: "invalid", wantError: "UPREST_ACQUIRE_TIMEOUT must be a positive duration"},
+				{name: "zero acquisition", acquire: "0s", wantError: "UPREST_ACQUIRE_TIMEOUT must be a positive duration"},
+				{name: "negative acquisition", acquire: "-1s", wantError: "UPREST_ACQUIRE_TIMEOUT must be a positive duration"},
+				{name: "overflowing acquisition", acquire: "3000000h", wantError: "UPREST_ACQUIRE_TIMEOUT must be a positive duration"},
+				{name: "malformed command", command: "invalid", wantError: "UPREST_COMMAND_TIMEOUT must be a positive duration"},
+				{name: "zero command", command: "0s", wantError: "UPREST_COMMAND_TIMEOUT must be a positive duration"},
+				{name: "negative command", command: "-1s", wantError: "UPREST_COMMAND_TIMEOUT must be a positive duration"},
+				{name: "overflowing command", command: "3000000h", wantError: "UPREST_COMMAND_TIMEOUT must be a positive duration"},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					clearConfiguration(t)
+					t.Setenv("UPREST_MODE", mode)
+					t.Setenv("UPREST_TOKEN", "test-token")
+					t.Setenv("UPREST_CONNECTION_STRING", "redis://localhost:6379")
+					t.Setenv("UPREST_ACQUIRE_TIMEOUT", test.acquire)
+					t.Setenv("UPREST_COMMAND_TIMEOUT", test.command)
+
+					if mode == "file" {
+						path := filepath.Join(t.TempDir(), "tokens.json")
+						contents := `{"test-token":{"id":"test","connection_string":"redis://localhost:6379"}}`
+
+						if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+							t.Fatal(err)
+						}
+
+						t.Setenv("UPREST_TOKENS_FILE", path)
+					}
+
+					cfg, err := Load()
+
+					if test.wantError != "" {
+						if err == nil || !strings.Contains(err.Error(), test.wantError) {
+							t.Fatalf("got error %v, want %q", err, test.wantError)
+						}
+
+						return
+					}
+
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if cfg.AcquireTimeout != test.wantAcquire || cfg.CommandTimeout != test.wantCommand || cfg.HTTPWriteTimeout != test.wantHTTP {
+						t.Fatalf("unexpected timeouts: acquire=%s, command=%s, HTTP=%s", cfg.AcquireTimeout, cfg.CommandTimeout, cfg.HTTPWriteTimeout)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -234,6 +306,8 @@ func clearConfiguration(t *testing.T) {
 		"UPREST_PORT",
 		"UPREST_IPV6",
 		"UPREST_IDLE_TIMEOUT",
+		"UPREST_ACQUIRE_TIMEOUT",
+		"UPREST_COMMAND_TIMEOUT",
 		"UPREST_LOG_LEVEL",
 		"UPREST_TOKENS_FILE",
 		"UPREST_METRICS_TOKEN",

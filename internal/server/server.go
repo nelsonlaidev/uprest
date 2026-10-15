@@ -26,7 +26,7 @@ import (
 )
 
 const maxBodySize = 10 << 20
-const commandTimeout = 30 * time.Second
+const streamInitializationTimeout = 30 * time.Second
 const readinessTimeout = 2 * time.Second
 const streamHeartbeatInterval = 15 * time.Second
 const streamWriteTimeout = 5 * time.Second
@@ -60,6 +60,8 @@ type apiHandler struct {
 	requests       *prometheus.CounterVec
 	duration       *prometheus.HistogramVec
 	streams        *prometheus.GaugeVec
+	acquireTimeout time.Duration
+	commandTimeout time.Duration
 }
 
 type statusWriter struct {
@@ -67,16 +69,18 @@ type statusWriter struct {
 	status int
 }
 
-func NewHandler(pools *redisproxy.Manager, logger *slog.Logger, metricsToken string, registry *prometheus.Registry) http.Handler {
+func NewHandler(pools *redisproxy.Manager, logger *slog.Logger, metricsToken string, registry *prometheus.Registry, acquireTimeout, commandTimeout time.Duration) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	handler := &apiHandler{
-		pools:        pools,
-		logger:       logger,
-		normalizer:   scriptnorm.New(),
-		metricsToken: metricsToken,
+		pools:          pools,
+		logger:         logger,
+		normalizer:     scriptnorm.New(),
+		metricsToken:   metricsToken,
+		acquireTimeout: acquireTimeout,
+		commandTimeout: commandTimeout,
 	}
 
 	if registry != nil {
@@ -267,7 +271,7 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	acquireCtx, cancelAcquire := context.WithTimeout(r.Context(), commandTimeout)
+	acquireCtx, cancelAcquire := context.WithTimeout(r.Context(), h.acquireTimeout)
 	var client *redis.Client
 	var release func()
 
@@ -380,7 +384,7 @@ func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client
 
 	defer stopMonitor(release, monitor, events)
 
-	confirmationTimer := time.NewTimer(commandTimeout)
+	confirmationTimer := time.NewTimer(streamInitializationTimeout)
 
 	defer confirmationTimer.Stop()
 
@@ -397,7 +401,7 @@ func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client
 
 		h.logger.DebugContext(r.Context(), "Redis monitor confirmation timed out",
 			"request_id", r.Context().Value(requestIDContextKey{}),
-			"timeout", commandTimeout,
+			"timeout", streamInitializationTimeout,
 		)
 		writeRedisUnavailable(w)
 		return
@@ -512,7 +516,7 @@ func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, c
 		_ = pubsub.Close()
 	}()
 
-	confirmation, err := pubsub.ReceiveTimeout(r.Context(), commandTimeout)
+	confirmation, err := pubsub.ReceiveTimeout(r.Context(), streamInitializationTimeout)
 
 	if err != nil {
 		if r.Context().Err() == nil {
@@ -622,7 +626,7 @@ func (h *apiHandler) servePathCommand(w http.ResponseWriter, r *http.Request, cl
 }
 
 func (h *apiHandler) executeCommand(w http.ResponseWriter, r *http.Request, client *redis.Client, command []any, resp2Response bool) {
-	ctx, cancel := context.WithTimeout(r.Context(), commandTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), h.commandTimeout)
 
 	defer cancel()
 
@@ -666,7 +670,7 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), commandTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), h.commandTimeout)
 
 	defer cancel()
 
