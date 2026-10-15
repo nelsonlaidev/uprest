@@ -282,7 +282,7 @@ func TestNewManagerRejectsInvalidBackends(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			manager, err := NewManager(test.backends, time.Minute, nil)
+			manager, err := NewManager(test.backends, time.Minute, nil, nil)
 
 			if err == nil {
 				_ = manager.Close()
@@ -359,7 +359,7 @@ func newTestManager(t *testing.T, backends []Backend, idleTimeout time.Duration)
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager, err := NewManager(backends, idleTimeout, logger)
+	manager, err := NewManager(backends, idleTimeout, logger, nil)
 
 	if err != nil {
 		t.Fatal(err)

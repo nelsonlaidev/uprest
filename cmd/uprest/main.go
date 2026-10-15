@@ -13,6 +13,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/nelsonlaidev/uprest/internal/config"
 	"github.com/nelsonlaidev/uprest/internal/redisproxy"
 	"github.com/nelsonlaidev/uprest/internal/server"
@@ -37,7 +40,14 @@ func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
-	pools, err := redisproxy.NewManager(cfg.Backends, cfg.IdleTimeout, logger)
+	var registry *prometheus.Registry
+
+	if cfg.MetricsToken != "" {
+		registry = prometheus.NewRegistry()
+		registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	}
+
+	pools, err := redisproxy.NewManager(cfg.Backends, cfg.IdleTimeout, logger, registry)
 
 	if err != nil {
 		return fmt.Errorf("initialize Redis pools: %w", err)
@@ -62,7 +72,7 @@ func run() error {
 
 	httpServer := &http.Server{
 		Addr:    address,
-		Handler: server.NewHandler(pools, logger),
+		Handler: server.NewHandler(pools, logger, cfg.MetricsToken, registry),
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},

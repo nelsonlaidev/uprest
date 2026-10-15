@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/nelsonlaidev/uprest/internal/redisproxy"
@@ -24,6 +25,7 @@ type sseDeadlineWriter struct {
 	body      bytes.Buffer
 	deadlines []time.Time
 	flushed   bool
+	flushErr  error
 }
 
 func (w *sseDeadlineWriter) Header() http.Header {
@@ -39,7 +41,7 @@ func (w *sseDeadlineWriter) WriteHeader(int) {}
 func (w *sseDeadlineWriter) FlushError() error {
 	w.flushed = true
 
-	return nil
+	return w.flushErr
 }
 
 func (w *sseDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
@@ -54,7 +56,7 @@ func TestHealthAndReadyValidation(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   1,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	tests := []struct {
 		name   string
@@ -104,13 +106,13 @@ func TestHealthAndReadyValidation(t *testing.T) {
 	}
 
 	for _, path := range []string{"/health", "/ready"} {
-		if !reservedPath(path) || allowedMethods(path) != http.MethodGet {
+		if !reservedPath(path, false) || allowedMethods(path, false) != http.MethodGet {
 			t.Fatalf("probe %q has inconsistent routing classification", path)
 		}
 	}
 
 	for _, path := range []string{"/Health", "/health/", "/Ready", "/ready/", "/healthz", "/readyz"} {
-		if reservedPath(path) || allowedMethods(path) != http.MethodGet+", "+http.MethodPost {
+		if reservedPath(path, false) || allowedMethods(path, false) != http.MethodGet+", "+http.MethodPost {
 			t.Fatalf("path command %q unexpectedly classified as a probe", path)
 		}
 
@@ -134,7 +136,7 @@ func TestHealthShutdownAndReadyCancellation(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   1,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -202,7 +204,7 @@ func TestReadyColdConnectionDeadline(t *testing.T) {
 				ID:               "test",
 				ConnectionString: "redis://" + listener.Addr().String(),
 				MaxConnections:   1,
-			}}, io.Discard)
+			}}, io.Discard, "", nil)
 
 			if test.wait {
 				_, release, acquireErr := manager.Acquire(context.Background(), "test-token")
@@ -272,7 +274,7 @@ func TestHandlerRejectsUnauthorizedAndMalformedRequests(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	tests := []struct {
 		name   string
@@ -324,7 +326,7 @@ func TestQueryTokenAuthentication(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	tests := []struct {
 		name          string
@@ -413,8 +415,8 @@ func TestRequestLogging(t *testing.T) {
 				ID:               "test",
 				ConnectionString: "redis://localhost:1",
 				MaxConnections:   1,
-			}}, &logs)
-			handler := NewHandler(manager, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: test.level})))
+			}}, &logs, "", nil)
+			handler := NewHandler(manager, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: test.level})), "", nil)
 
 			if test.occupy {
 				_, release, err := manager.Acquire(context.Background(), "test-token")
@@ -500,7 +502,7 @@ func TestQueryTokenNotLogged(t *testing.T) {
 				ID:               "test",
 				ConnectionString: "redis://localhost:1",
 				MaxConnections:   3,
-			}}, &logs)
+			}}, &logs, "", nil)
 			request := httptest.NewRequest(http.MethodGet, "/monitor?_token="+test.token, nil)
 			response := httptest.NewRecorder()
 
@@ -523,7 +525,7 @@ func TestMonitorRequestValidationDoesNotCreatePool(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	for _, test := range []struct {
 		name       string
@@ -576,7 +578,7 @@ func TestMonitorCancellationBeforeStartDoesNotWriteError(t *testing.T) {
 	handler.serveMonitor(response, request, client, func() {
 		released = true
 		_ = client.Close()
-	})
+	}, "test")
 
 	if !released {
 		t.Fatal("canceled monitor did not release its dedicated client")
@@ -593,7 +595,7 @@ func TestSubscriptionRequestValidation(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	for _, test := range []struct {
 		name       string
@@ -745,7 +747,7 @@ func TestResponseFormatValidation(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	for _, test := range []struct {
 		name      string
@@ -824,7 +826,7 @@ func TestRESP2InfrastructureErrorsUseJSON(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://127.0.0.1:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	for _, test := range []struct {
 		name   string
@@ -860,7 +862,7 @@ func TestStreamingInfrastructureErrorsUseJSON(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://127.0.0.1:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	for _, test := range []struct {
 		path     string
@@ -922,7 +924,7 @@ func TestAuthenticatedResponsesIncludeSyncToken(t *testing.T) {
 		ID:               "test",
 		ConnectionString: "redis://localhost:1",
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	var previous string
 
@@ -944,11 +946,11 @@ func TestAuthenticatedResponsesIncludeSyncToken(t *testing.T) {
 	}
 }
 
-func newTestServer(t *testing.T, backends []redisproxy.Backend, logOutput io.Writer) (http.Handler, *redisproxy.Manager) {
+func newTestServer(t *testing.T, backends []redisproxy.Backend, logOutput io.Writer, metricsToken string, registry *prometheus.Registry) (http.Handler, *redisproxy.Manager) {
 	t.Helper()
 
 	logger := slog.New(slog.NewJSONHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	manager, err := redisproxy.NewManager(backends, time.Minute, logger)
+	manager, err := redisproxy.NewManager(backends, time.Minute, logger, registry)
 
 	if err != nil {
 		t.Fatal(err)
@@ -960,5 +962,5 @@ func newTestServer(t *testing.T, backends []redisproxy.Backend, logOutput io.Wri
 		}
 	})
 
-	return NewHandler(manager, logger), manager
+	return NewHandler(manager, logger, metricsToken, registry), manager
 }

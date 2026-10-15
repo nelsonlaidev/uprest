@@ -61,6 +61,7 @@ Uprest reads `UPREST_*` environment variables. `UPREST_MODE` selects a single ba
 | `UPREST_IPV6`              | `false`                          | Listen on IPv6                                        |
 | `UPREST_IDLE_TIMEOUT`      | `15m`                            | Time before an idle Redis pool closes                 |
 | `UPREST_LOG_LEVEL`         | `info`                           | JSON log level: `debug`, `info`, `warn`, or `error`   |
+| `UPREST_METRICS_TOKEN`     | Empty (disabled)                 | Dedicated Bearer token for `GET /metrics`            |
 
 ### Multiple tokens or backends
 
@@ -86,6 +87,7 @@ Each token selects its backend; `max_connections` is optional and defaults to `3
 | -------------------------- | ------ | -------------------------------------------------- |
 | `/health`                  | `GET`  | HTTP liveness check; no authentication required    |
 | `/ready`                   | `GET`  | Authenticated Redis backend readiness check        |
+| `/metrics`                 | `GET`  | Prometheus metrics; enabled by `UPREST_METRICS_TOKEN` |
 | `/`                        | `POST` | JSON command array                                 |
 | `/pipeline`                | `POST` | JSON array of commands                             |
 | `/multi-exec`              | `POST` | JSON array of commands run in Redis `MULTI`/`EXEC` |
@@ -95,7 +97,7 @@ Each token selects its backend; `max_connections` is optional and defaults to `3
 | `/<command>/<args...>`     | `GET`  | URL-encoded arguments                              |
 | `/<command>/<args...>`     | `POST` | URL arguments and the body as the final Redis value |
 
-Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. An `Authorization` header takes precedence and does not fall back to `_token`; only `/health` is public.
+Authenticate with `Authorization: Bearer <token>` or the `_token` query parameter. An `Authorization` header takes precedence and does not fall back to `_token`; only `/health` is public. When enabled, `/metrics` accepts only its dedicated Bearer token and does not accept backend tokens or `_token`.
 
 An empty path-command `POST` body becomes an empty Redis argument; use `GET` when no body argument is needed. Request bodies are limited to 10 MiB, and `HEAD`/`PUT` command requests are unsupported.
 
@@ -106,6 +108,56 @@ JSON is the default response format. Add `Upstash-Encoding: base64` to base64-en
 Errors use `{"error":"..."}`. Validation and Redis command errors return `400`, authentication failures `401`, unsupported methods `405`, unavailable Redis backends `502`, and connection acquisition failures `503`.
 
 `/health` and `/ready` are reserved paths and return JSON status objects; send Redis commands with those names through `POST /`.
+
+### Metrics
+
+Set `UPREST_METRICS_TOKEN` to enable authenticated Prometheus metrics on the same HTTP port. The monitoring token must differ from every backend token, and backend IDs must be unique when metrics are enabled. Invalid configuration prevents startup without printing tokens. An unset or empty value disables metrics, including collection, and preserves `/metrics` as an ordinary Redis path command. The bundled Compose example keeps metrics disabled.
+
+```sh
+curl --fail -H "Authorization: Bearer $UPREST_METRICS_TOKEN" http://localhost:8079/metrics
+```
+
+Only the exact `/metrics` path accepts monitoring credentials. GET returns Prometheus exposition with `Cache-Control: no-store`; invalid credentials return JSON 401, and other methods return JSON 405 with `Allow: GET` after authentication. Upstash response headers are ignored. Scraping does not contact Redis, acquire capacity, or keep pools active. Scrapes are excluded from HTTP business metrics; successful scrapes log at debug level and failures at info level.
+
+Configure Prometheus to read the token from a file containing only the token value:
+
+```yaml
+scrape_configs:
+  - job_name: uprest
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['uprest:8080']
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/uprest_metrics_token
+```
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `uprest_http_requests_total` | Counter | `route`, `method`, `status` |
+| `uprest_http_request_duration_seconds` | Histogram | `route`, `method` |
+| `uprest_redis_capacity_limit` | Gauge | `backend_id` |
+| `uprest_redis_capacity_in_use` | Gauge | `backend_id` |
+| `uprest_redis_acquire_duration_seconds` | Histogram | `backend_id`, `outcome` |
+| `uprest_streams_active` | Gauge | `backend_id`, `kind` |
+| `uprest_redis_pools_active` | Gauge | None |
+| `uprest_redis_pools_created_total` | Counter | None |
+| `uprest_redis_pools_evicted_total` | Counter | None |
+
+HTTP metrics count requests when handlers finish, including authentication and validation failures. Routes are fixed categories: `command`, `pipeline`, `transaction`, `pubsub`, `monitor`, `health`, `ready`, and `unsupported`. Standard HTTP methods retain their names; other methods use `OTHER`. Requests canceled before writing a response use `status="canceled"`; requests that already wrote a status retain it. HTTP duration includes the entire SSE stream lifetime, so filter by route when comparing command latency. Stream gauges count Pub/Sub and MONITOR only after Redis confirmation and a successful first event, and return to zero on exit.
+
+Capacity gauges measure occupied slots, including commands and streams, rather than physical Redis sockets. Acquisition duration measures capacity acquisition only, excluding Redis handshakes and command execution; readiness acquisition is included. Outcomes are `acquired`, `timeout`, `canceled`, and `closed`. Histograms use second buckets of `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30`, plus `+Inf`. Counters reset when the process restarts. Go runtime metrics and process metrics are also exported; process metric availability depends on the operating system. Labels never include tokens, Redis URLs, keys, channels, raw paths, or error messages.
+
+Example PromQL for HTTP 5xx error rate, capacity timeouts, and capacity utilization:
+
+```promql
+sum(rate(uprest_http_requests_total{status=~"5.."}[5m]))
+  / sum(rate(uprest_http_requests_total[5m]))
+
+sum by (backend_id) (rate(uprest_redis_acquire_duration_seconds_count{outcome="timeout"}[5m]))
+
+uprest_redis_capacity_in_use / uprest_redis_capacity_limit
+```
 
 ### Pub/Sub
 

@@ -19,13 +19,14 @@ const defaultIdleTimeout = 15 * time.Minute
 const defaultTokensFile = "/app/uprest-config/tokens.json" //nolint:gosec // G101: file path, not a credential
 
 type Config struct {
-	Mode        string
-	Backends    []redisproxy.Backend
-	TokensFile  string
-	Port        int
-	IPv6        bool
-	IdleTimeout time.Duration
-	LogLevel    slog.Level
+	Mode         string
+	Backends     []redisproxy.Backend
+	TokensFile   string
+	Port         int
+	IPv6         bool
+	IdleTimeout  time.Duration
+	LogLevel     slog.Level
+	MetricsToken string
 }
 
 type fileBackend struct {
@@ -42,10 +43,11 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Mode:        mode,
-		Port:        defaultPort,
-		IdleTimeout: defaultIdleTimeout,
-		LogLevel:    slog.LevelInfo,
+		Mode:         mode,
+		Port:         defaultPort,
+		IdleTimeout:  defaultIdleTimeout,
+		LogLevel:     slog.LevelInfo,
+		MetricsToken: os.Getenv("UPREST_METRICS_TOKEN"),
 	}
 
 	if value := os.Getenv("UPREST_PORT"); value != "" {
@@ -118,6 +120,22 @@ func Load() (Config, error) {
 
 	if err != nil {
 		return Config{}, err
+	}
+
+	if cfg.MetricsToken != "" {
+		ids := make(map[string]struct{}, len(cfg.Backends))
+
+		for _, backend := range cfg.Backends {
+			if cfg.MetricsToken == backend.Token {
+				return Config{}, fmt.Errorf("UPREST_METRICS_TOKEN must differ from backend tokens")
+			}
+
+			if _, exists := ids[backend.ID]; exists {
+				return Config{}, fmt.Errorf("backend IDs must be unique when metrics are enabled")
+			}
+
+			ids[backend.ID] = struct{}{}
+		}
 	}
 
 	return cfg, nil

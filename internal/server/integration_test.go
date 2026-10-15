@@ -18,10 +18,150 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/nelsonlaidev/uprest/internal/redisproxy"
 )
+
+func TestStreamMetricsWithRedis(t *testing.T) {
+	client := redisIntegrationClient(t)
+
+	for _, test := range []struct {
+		name string
+		kind string
+	}{
+		{"subscribe", "pubsub"},
+		{"psubscribe", "pubsub"},
+		{"monitor", "monitor"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			handler, _ := newTestServer(t, []redisproxy.Backend{{
+				Token: "test-token", ID: "integration", ConnectionString: redisIntegrationURL(t), MaxConnections: 1,
+			}}, io.Discard, "metrics-secret", registry)
+			finished := make(chan struct{})
+			httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handler.ServeHTTP(w, r)
+				close(finished)
+			}))
+
+			t.Cleanup(httpServer.Close)
+
+			channel := fmt.Sprintf("uprest:metrics:%s:%d", test.name, time.Now().UnixNano())
+			path := "/" + test.name
+
+			switch test.name {
+			case "subscribe":
+				path += "/" + url.PathEscape(channel)
+			case "psubscribe":
+				path += "/" + url.PathEscape(channel+"*")
+			}
+
+			response, reader, cancel := openSSEStream(t, httpServer.URL, path, nil)
+
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("stream initialization returned %d", response.StatusCode)
+			}
+
+			_ = readSSEEvent(t, reader, 5*time.Second)
+			ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+
+			defer stop()
+
+			if test.kind == "monitor" {
+				if err := client.Ping(ctx).Err(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := client.Publish(ctx, channel, "metrics confirmation").Err(); err != nil {
+				t.Fatal(err)
+			}
+
+			// A second event proves the first event's write and gauge increment completed.
+			_ = readSSEEvent(t, reader, 5*time.Second)
+			labels := map[string]string{"backend_id": "integration", "kind": test.kind}
+
+			if metricSample(t, registry, "uprest_streams_active", labels).Gauge.GetValue() != 1 {
+				t.Fatal("confirmed stream was not counted")
+			}
+
+			if metricSample(t, registry, "uprest_redis_capacity_in_use", map[string]string{"backend_id": "integration"}).Gauge.GetValue() != 1 {
+				t.Fatal("stream capacity was not counted")
+			}
+
+			cancel()
+			_ = response.Body.Close()
+
+			select {
+			case <-finished:
+			case <-time.After(10 * time.Second):
+				t.Fatal("canceled stream handler did not finish")
+			}
+
+			if metricSample(t, registry, "uprest_streams_active", labels).Gauge.GetValue() != 0 || metricSample(t, registry, "uprest_redis_capacity_in_use", map[string]string{"backend_id": "integration"}).Gauge.GetValue() != 0 {
+				t.Fatal("canceled stream leaked an active gauge or lease")
+			}
+
+			route := test.kind
+			sample := metricSample(t, registry, "uprest_http_requests_total", map[string]string{"route": route, "method": "POST", "status": "200"})
+
+			if sample.Counter.GetValue() != 1 || metricSample(t, registry, "uprest_http_request_duration_seconds", map[string]string{"route": route, "method": "POST"}).Histogram.GetSampleCount() != 1 {
+				t.Fatal("completed stream HTTP metrics were not recorded once")
+			}
+		})
+	}
+}
+
+func TestFailedStreamMetricsWithRedis(t *testing.T) {
+	connectionString := redisIntegrationURL(t)
+	invalidCredentials, err := url.Parse(connectionString)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	invalidCredentials.User = url.UserPassword("uprest-metrics-invalid-user", "invalid-password")
+
+	for _, phase := range []struct {
+		name             string
+		connectionString string
+		flushed          bool
+	}{
+		{"Redis initialization failure", invalidCredentials.String(), false},
+		{"first event failure", connectionString, true},
+	} {
+		t.Run(phase.name, func(t *testing.T) {
+			for _, path := range []string{"/subscribe/metrics-write-failure", "/psubscribe/metrics-write-failure*", "/monitor"} {
+				t.Run(path, func(t *testing.T) {
+					registry := prometheus.NewRegistry()
+					handler, _ := newTestServer(t, []redisproxy.Backend{{
+						Token: "test-token", ID: "integration", ConnectionString: phase.connectionString, MaxConnections: 1,
+					}}, io.Discard, "metrics-secret", registry)
+					request := httptest.NewRequest(http.MethodPost, path, nil)
+					request.Header.Set("Authorization", "Bearer test-token")
+					writer := &sseDeadlineWriter{header: make(http.Header), flushErr: errors.New("client disconnected")}
+					handler.ServeHTTP(writer, request)
+
+					if writer.flushed != phase.flushed || metricSample(t, registry, "uprest_redis_capacity_in_use", map[string]string{"backend_id": "integration"}).Gauge.GetValue() != 0 {
+						t.Fatal("failed stream did not release capacity or reached the wrong initialization phase")
+					}
+
+					families, err := registry.Gather()
+
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					for _, family := range families {
+						if family.GetName() == "uprest_streams_active" {
+							t.Fatal("failed stream created an active stream metric")
+						}
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestReadyWithRedis(t *testing.T) {
 	var logs bytes.Buffer
@@ -38,7 +178,7 @@ func TestReadyWithRedis(t *testing.T) {
 			ConnectionString: "redis://localhost:1",
 			MaxConnections:   1,
 		},
-	}, &logs)
+	}, &logs, "", nil)
 
 	for _, test := range []struct {
 		name   string
@@ -743,7 +883,7 @@ func TestMultiTenantTokenRoutingWithRedis(t *testing.T) {
 			ConnectionString: analyticsURL.String(),
 			MaxConnections:   4,
 		},
-	}, io.Discard)
+	}, io.Discard, "", nil)
 	key := fmt.Sprintf("uprest:tenant:%d", time.Now().UnixNano())
 
 	t.Cleanup(func() {
@@ -932,7 +1072,7 @@ func TestSubscriptionCancellationReleasesLeaseWithRedis(t *testing.T) {
 		ID:               "integration",
 		ConnectionString: redisIntegrationURL(t),
 		MaxConnections:   1,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 	httpServer := httptest.NewServer(handler)
 
 	t.Cleanup(httpServer.Close)
@@ -993,7 +1133,7 @@ func TestMonitorWithRedis(t *testing.T) {
 		ID:               "integration",
 		ConnectionString: redisIntegrationURL(t),
 		MaxConnections:   1,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 	httpServer := httptest.NewServer(handler)
 
 	t.Cleanup(httpServer.Close)
@@ -1206,7 +1346,7 @@ func redisIntegrationHandler(t *testing.T) http.Handler {
 		ID:               "integration",
 		ConnectionString: redisIntegrationURL(t),
 		MaxConnections:   3,
-	}}, io.Discard)
+	}}, io.Discard, "", nil)
 
 	return handler
 }

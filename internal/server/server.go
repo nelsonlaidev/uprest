@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/nelsonlaidev/uprest/internal/redisproxy"
@@ -49,9 +52,14 @@ var errInvalidMonitorConfirmation = errors.New("invalid monitor confirmation")
 type requestIDContextKey struct{}
 
 type apiHandler struct {
-	pools      *redisproxy.Manager
-	logger     *slog.Logger
-	normalizer *scriptnorm.Normalizer
+	pools          *redisproxy.Manager
+	logger         *slog.Logger
+	normalizer     *scriptnorm.Normalizer
+	metricsToken   string
+	metricsHandler http.Handler
+	requests       *prometheus.CounterVec
+	duration       *prometheus.HistogramVec
+	streams        *prometheus.GaugeVec
 }
 
 type statusWriter struct {
@@ -59,16 +67,37 @@ type statusWriter struct {
 	status int
 }
 
-func NewHandler(pools *redisproxy.Manager, logger *slog.Logger) http.Handler {
+func NewHandler(pools *redisproxy.Manager, logger *slog.Logger, metricsToken string, registry *prometheus.Registry) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	return &apiHandler{
-		pools:      pools,
-		logger:     logger,
-		normalizer: scriptnorm.New(),
+	handler := &apiHandler{
+		pools:        pools,
+		logger:       logger,
+		normalizer:   scriptnorm.New(),
+		metricsToken: metricsToken,
 	}
+
+	if registry != nil {
+		handler.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "uprest_http_requests_total",
+			Help: "Completed HTTP requests, excluding metrics scrapes.",
+		}, []string{"route", "method", "status"})
+		handler.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "uprest_http_request_duration_seconds",
+			Help:    "Full HTTP handler lifetime, including the full lifetime of SSE streams, excluding metrics scrapes.",
+			Buckets: redisproxy.MetricsDurationBuckets,
+		}, []string{"route", "method"})
+		handler.streams = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "uprest_streams_active",
+			Help: "Confirmed SSE streams whose first event was written successfully.",
+		}, []string{"backend_id", "kind"})
+		registry.MustRegister(handler.requests, handler.duration, handler.streams)
+		handler.metricsHandler = promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	}
+
+	return handler
 }
 
 func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -76,12 +105,14 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := newRequestID()
 	r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID))
 	response := &statusWriter{ResponseWriter: w}
+	metricsRequest := h.metricsHandler != nil && r.URL.Path == "/metrics"
 
 	defer func() {
 		duration := time.Since(started)
 		status := response.status
 		level := slog.LevelInfo
 		message := "request completed"
+		metricStatus := "canceled"
 		attributes := []any{
 			"request_id", requestID,
 			"method", r.Method,
@@ -98,10 +129,26 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			attributes = append(attributes, "status", status)
+			metricStatus = strconv.Itoa(status)
 
-			if status == http.StatusOK && (r.URL.Path == "/health" || r.URL.Path == "/ready") {
+			if status == http.StatusOK && (r.URL.Path == "/health" || r.URL.Path == "/ready" || metricsRequest) {
 				level = slog.LevelDebug
 			}
+		}
+
+		if h.requests != nil && !metricsRequest {
+			method := r.Method
+
+			switch method {
+			case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete,
+				http.MethodConnect, http.MethodOptions, http.MethodTrace, http.MethodPatch:
+			default:
+				method = "OTHER"
+			}
+
+			route := metricRoute(r.URL.Path)
+			h.requests.WithLabelValues(route, method, metricStatus).Inc()
+			h.duration.WithLabelValues(route, method).Observe(duration.Seconds())
 		}
 
 		h.logger.Log(r.Context(), level, message, attributes...)
@@ -111,6 +158,25 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
+	if h.metricsHandler != nil && r.URL.Path == "/metrics" {
+		w.Header().Set("Cache-Control", "no-store")
+		token, ok := bearerToken(r)
+
+		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(h.metricsToken)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
+			return
+		}
+
+		h.metricsHandler.ServeHTTP(w, r)
+		return
+	}
+
 	if r.URL.Path == "/health" || r.URL.Path == "/ready" {
 		w.Header().Set("Cache-Control", "no-store")
 	}
@@ -187,8 +253,8 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if r.Method != http.MethodPost && (r.Method != http.MethodGet || reservedPath(r.URL.Path)) {
-			w.Header().Set("Allow", allowedMethods(r.URL.Path))
+		if r.Method != http.MethodPost && (r.Method != http.MethodGet || reservedPath(r.URL.Path, h.metricsHandler != nil)) {
+			w.Header().Set("Allow", allowedMethods(r.URL.Path, h.metricsHandler != nil))
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
 			return
 		}
@@ -228,14 +294,16 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if monitor {
-		h.serveMonitor(w, r, client, release)
+		backendID, _ := h.pools.BackendID(token)
+		h.serveMonitor(w, r, client, release, backendID)
 		return
 	}
 
 	defer release()
 
 	if subscription {
-		h.serveSubscription(w, r, client, subscriptionNames, patternSubscription)
+		backendID, _ := h.pools.BackendID(token)
+		h.serveSubscription(w, r, client, subscriptionNames, patternSubscription, backendID)
 		return
 	}
 
@@ -249,11 +317,11 @@ func (h *apiHandler) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/multi-exec":
 		h.serveBatch(w, r, client, true, false)
 
-	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && !reservedPath(r.URL.Path):
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && !reservedPath(r.URL.Path, h.metricsHandler != nil):
 		h.servePathCommand(w, r, client, resp2Response)
 
 	default:
-		w.Header().Set("Allow", allowedMethods(r.URL.Path))
+		w.Header().Set("Allow", allowedMethods(r.URL.Path, h.metricsHandler != nil))
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method Not Allowed"})
 	}
 }
@@ -289,7 +357,7 @@ func (h *apiHandler) serveReady(w http.ResponseWriter, r *http.Request, token st
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
 }
 
-func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client *redis.Client, release func()) {
+func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client *redis.Client, release func(), backendID string) {
 	events := make(chan string, monitorEventBufferSize)
 	// MonitorCmd starts a background reader after its initial Process call returns.
 	// A sticky Conn keeps that socket out of the ordinary pool while the reader owns it.
@@ -352,6 +420,13 @@ func (h *apiHandler) serveMonitor(w http.ResponseWriter, r *http.Request, client
 
 	if err := writeSSE(w, controller, firstEvent); err != nil {
 		return
+	}
+
+	if h.streams != nil {
+		stream := h.streams.WithLabelValues(backendID, "monitor")
+		stream.Inc()
+
+		defer stream.Dec()
 	}
 
 	heartbeat := time.NewTimer(streamHeartbeatInterval)
@@ -424,7 +499,7 @@ func stopMonitor(release func(), monitor *redis.MonitorCmd, events <-chan string
 	}
 }
 
-func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, client *redis.Client, names []string, pattern bool) {
+func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, client *redis.Client, names []string, pattern bool, backendID string) {
 	var pubsub *redis.PubSub
 
 	if pattern {
@@ -462,6 +537,13 @@ func (h *apiHandler) serveSubscription(w http.ResponseWriter, r *http.Request, c
 
 	if err := writeSSE(w, controller, firstEvent); err != nil {
 		return
+	}
+
+	if h.streams != nil {
+		stream := h.streams.WithLabelValues(backendID, "pubsub")
+		stream.Inc()
+
+		defer stream.Dec()
 	}
 
 	events := pubsub.ChannelWithSubscriptions()
@@ -735,8 +817,8 @@ func requestBody(w http.ResponseWriter, r *http.Request) io.Reader {
 	return http.MaxBytesReader(w, r.Body, maxBodySize)
 }
 
-func reservedPath(path string) bool {
-	return path == "/" || path == "/pipeline" || path == "/multi-exec" || path == "/health" || path == "/ready"
+func reservedPath(path string, metricsEnabled bool) bool {
+	return path == "/" || path == "/pipeline" || path == "/multi-exec" || path == "/health" || path == "/ready" || (metricsEnabled && path == "/metrics")
 }
 
 func monitorRoute(path string) bool {
@@ -788,16 +870,43 @@ func unsupportedEndpoint(path string) bool {
 	return strings.EqualFold(segment, "monitor")
 }
 
-func allowedMethods(path string) string {
-	if path == "/health" || path == "/ready" {
+func allowedMethods(path string, metricsEnabled bool) string {
+	if path == "/health" || path == "/ready" || (metricsEnabled && path == "/metrics") {
 		return http.MethodGet
 	}
 
-	if reservedPath(path) {
+	if reservedPath(path, metricsEnabled) {
 		return http.MethodPost
 	}
 
 	return http.MethodGet + ", " + http.MethodPost
+}
+
+func metricRoute(path string) string {
+	switch path {
+	case "/health":
+		return "health"
+	case "/ready":
+		return "ready"
+	case "/pipeline":
+		return "pipeline"
+	case "/multi-exec":
+		return "transaction"
+	}
+
+	if monitorRoute(path) {
+		return "monitor"
+	}
+
+	if _, ok := subscriptionRoute(path); ok {
+		return "pubsub"
+	}
+
+	if unsupportedEndpoint(path) {
+		return "unsupported"
+	}
+
+	return "command"
 }
 
 func responseUsesBase64(r *http.Request) bool {

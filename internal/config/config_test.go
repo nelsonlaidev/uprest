@@ -23,7 +23,7 @@ func TestLoadEnvironmentMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if cfg.Mode != "env" || cfg.Port != 80 || cfg.IPv6 || cfg.IdleTimeout != 15*time.Minute || cfg.LogLevel != slog.LevelInfo {
+	if cfg.Mode != "env" || cfg.Port != 80 || cfg.IPv6 || cfg.IdleTimeout != 15*time.Minute || cfg.LogLevel != slog.LevelInfo || cfg.MetricsToken != "" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 
@@ -43,6 +43,7 @@ func TestLoadEnvironmentMode(t *testing.T) {
 	t.Setenv("UPREST_IPV6", "true")
 	t.Setenv("UPREST_IDLE_TIMEOUT", "30s")
 	t.Setenv("UPREST_LOG_LEVEL", "debug")
+	t.Setenv("UPREST_METRICS_TOKEN", "monitoring-secret")
 
 	cfg, err = Load()
 
@@ -50,7 +51,7 @@ func TestLoadEnvironmentMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if cfg.Backends[0].MaxConnections != 5 || cfg.Port != 8079 || !cfg.IPv6 || cfg.IdleTimeout != 30*time.Second || cfg.LogLevel != slog.LevelDebug {
+	if cfg.Backends[0].MaxConnections != 5 || cfg.Port != 8079 || !cfg.IPv6 || cfg.IdleTimeout != 30*time.Second || cfg.LogLevel != slog.LevelDebug || cfg.MetricsToken != "monitoring-secret" {
 		t.Fatalf("unexpected overrides: %+v", cfg)
 	}
 }
@@ -101,6 +102,53 @@ func TestLoadFileMode(t *testing.T) {
 
 	if cfg.Mode != "file" || cfg.TokensFile != path || !reflect.DeepEqual(cfg.Backends, wantBackends) {
 		t.Fatalf("unexpected file configuration: %+v", cfg)
+	}
+}
+
+func TestMetricsConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		token       string
+		duplicateID bool
+		wantError   bool
+	}{
+		{name: "disabled preserves duplicate IDs", duplicateID: true},
+		{name: "enabled", token: "monitoring-secret"},
+		{name: "duplicate IDs", token: "monitoring-secret", duplicateID: true, wantError: true},
+		{name: "backend token collision", token: "backend-secret", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfiguration(t)
+			t.Setenv("UPREST_MODE", "file")
+			t.Setenv("UPREST_METRICS_TOKEN", test.token)
+			secondID := "second"
+
+			if test.duplicateID {
+				secondID = "first"
+			}
+
+			contents := `{"backend-secret":{"id":"first","connection_string":"redis://localhost:6379"},"other-secret":{"id":"` + secondID + `","connection_string":"redis://localhost:6380"}}`
+			path := filepath.Join(t.TempDir(), "tokens.json")
+
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Setenv("UPREST_TOKENS_FILE", path)
+			cfg, err := Load()
+
+			if test.wantError {
+				if err == nil || strings.Contains(err.Error(), test.token) || strings.Contains(err.Error(), "backend-secret") {
+					t.Fatalf("unexpected validation error: %v", err)
+				}
+
+				return
+			}
+
+			if err != nil || cfg.MetricsToken != test.token {
+				t.Fatalf("unexpected metrics configuration: token configured=%t, error=%v", cfg.MetricsToken != "", err)
+			}
+		})
 	}
 }
 
@@ -188,6 +236,7 @@ func clearConfiguration(t *testing.T) {
 		"UPREST_IDLE_TIMEOUT",
 		"UPREST_LOG_LEVEL",
 		"UPREST_TOKENS_FILE",
+		"UPREST_METRICS_TOKEN",
 	}
 
 	for _, key := range keys {

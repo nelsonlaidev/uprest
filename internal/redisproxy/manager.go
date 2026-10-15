@@ -10,11 +10,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
 
 var ErrUnauthorized = errors.New("unauthorized token")
 var ErrClosed = errors.New("pool manager is closed")
+
+// MetricsDurationBuckets are shared by HTTP and capacity acquisition histograms.
+var MetricsDurationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30}
 
 type Stats struct {
 	Active  int
@@ -50,20 +54,21 @@ type managedPool struct {
 }
 
 type Manager struct {
-	mu          sync.Mutex
-	backends    map[[sha256.Size]byte]*backend
-	pools       map[poolKey]*managedPool
-	idleTimeout time.Duration
-	logger      *slog.Logger
-	stop        chan struct{}
-	done        chan struct{}
-	closed      bool
-	leases      sync.WaitGroup
-	created     atomic.Uint64
-	evicted     atomic.Uint64
+	mu              sync.Mutex
+	backends        map[[sha256.Size]byte]*backend
+	pools           map[poolKey]*managedPool
+	idleTimeout     time.Duration
+	logger          *slog.Logger
+	stop            chan struct{}
+	done            chan struct{}
+	closed          bool
+	leases          sync.WaitGroup
+	created         atomic.Uint64
+	evicted         atomic.Uint64
+	acquireDuration *prometheus.HistogramVec
 }
 
-func NewManager(backends []Backend, idleTimeout time.Duration, logger *slog.Logger) (*Manager, error) {
+func NewManager(backends []Backend, idleTimeout time.Duration, logger *slog.Logger, registry *prometheus.Registry) (*Manager, error) {
 	if len(backends) == 0 {
 		return nil, fmt.Errorf("at least one Redis backend is required")
 	}
@@ -126,6 +131,56 @@ func NewManager(backends []Backend, idleTimeout time.Duration, logger *slog.Logg
 			slots:          make(chan struct{}, configured.MaxConnections),
 		}
 		manager.backends[tokenHash] = poolBackend
+	}
+
+	if registry != nil {
+		manager.acquireDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "uprest_redis_acquire_duration_seconds",
+			Help:    "Time spent acquiring backend capacity, excluding Redis connection initialization and commands.",
+			Buckets: MetricsDurationBuckets,
+		}, []string{"backend_id", "outcome"})
+
+		collectors := []prometheus.Collector{
+			manager.acquireDuration,
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "uprest_redis_pools_active",
+				Help: "Current number of shared Redis pools.",
+			}, func() float64 { return float64(manager.Stats().Active) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "uprest_redis_pools_created_total",
+				Help: "Total shared Redis pools created.",
+			}, func() float64 { return float64(manager.Stats().Created) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "uprest_redis_pools_evicted_total",
+				Help: "Total shared Redis pools evicted after becoming idle.",
+			}, func() float64 { return float64(manager.Stats().Evicted) }),
+		}
+
+		for _, poolBackend := range manager.backends {
+			labels := prometheus.Labels{"backend_id": poolBackend.id}
+			collectors = append(collectors,
+				prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+					Name:        "uprest_redis_capacity_limit",
+					Help:        "Configured backend capacity limit.",
+					ConstLabels: labels,
+				}, func() float64 { return float64(poolBackend.maxConnections) }),
+				prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+					Name:        "uprest_redis_capacity_in_use",
+					Help:        "Occupied backend capacity slots, including commands and streams.",
+					ConstLabels: labels,
+				}, func() float64 { return float64(len(poolBackend.slots)) }),
+			)
+
+			for _, outcome := range []string{"acquired", "timeout", "canceled", "closed"} {
+				manager.acquireDuration.WithLabelValues(poolBackend.id, outcome)
+			}
+		}
+
+		for _, collector := range collectors {
+			if err := registry.Register(collector); err != nil {
+				return nil, fmt.Errorf("register Redis metrics: %w", err)
+			}
+		}
 	}
 
 	go manager.evictIdlePools()
@@ -208,10 +263,20 @@ func (m *Manager) AcquireDedicated(ctx context.Context, token string) (*redis.Cl
 }
 
 func (m *Manager) Authorized(token string) bool {
-	tokenHash := sha256.Sum256([]byte(token))
-	_, authorized := m.backends[tokenHash]
+	_, authorized := m.BackendID(token)
 
 	return authorized
+}
+
+func (m *Manager) BackendID(token string) (string, bool) {
+	tokenHash := sha256.Sum256([]byte(token))
+	poolBackend, authorized := m.backends[tokenHash]
+
+	if !authorized {
+		return "", false
+	}
+
+	return poolBackend.id, true
 }
 
 func (m *Manager) Stats() Stats {
@@ -270,11 +335,29 @@ func (m *Manager) acquireBackend(ctx context.Context, token string) (*backend, f
 		return nil, nil, ErrUnauthorized
 	}
 
+	outcome := "acquired"
+
+	if m.acquireDuration != nil {
+		started := time.Now()
+
+		defer func() {
+			m.acquireDuration.WithLabelValues(poolBackend.id, outcome).Observe(time.Since(started).Seconds())
+		}()
+	}
+
 	select {
 	case poolBackend.slots <- struct{}{}:
 	case <-ctx.Done():
+		outcome = "canceled"
+
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			outcome = "timeout"
+		}
+
 		return nil, nil, ctx.Err()
 	case <-m.stop:
+		outcome = "closed"
+
 		return nil, nil, ErrClosed
 	}
 
@@ -283,6 +366,7 @@ func (m *Manager) acquireBackend(ctx context.Context, token string) (*backend, f
 	if m.closed {
 		m.mu.Unlock()
 		<-poolBackend.slots
+		outcome = "closed"
 
 		return nil, nil, ErrClosed
 	}
