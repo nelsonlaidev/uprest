@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.1
+
+[Compare v0.5.0...v0.5.1](https://github.com/nelsonlaidev/uprest/compare/v0.5.0...v0.5.1) - 2026-11-12
+
+
+### Highlights
+
+- Fix compatibility with `@upstash/redis` clients that send `XAUTOCLAIM COUNT 0`. Return `["0-0", [], []]` without claiming messages or removing deleted entries from the pending list.
+- Support this behavior for body and path commands, pipelines, and transactions, including `JUSTID`, Base64, and RESP2 responses. Preserve validation and permission errors; other counts retain Redis behavior.
+- Document the Lua adapter's permission requirements: Redis users need `EVAL` and `XPENDING` in addition to `XAUTOCLAIM` to use `COUNT 0`.
+
+### Breaking changes
+
+- None.
+
+### Bug Fixes
+
+- Support XAUTOCLAIM COUNT 0 compatibility (#8) - ([47d556a](https://github.com/nelsonlaidev/uprest/commit/47d556a0815c674553aae510db05b760d8abc087))
+
 ## v0.5.0
 
 [Compare v0.4.0...v0.5.0](https://github.com/nelsonlaidev/uprest/compare/v0.4.0...v0.5.0) - 2026-10-15
