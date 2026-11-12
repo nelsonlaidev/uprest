@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.0
+
+[Compare v0.4.0...v0.5.0](https://github.com/nelsonlaidev/uprest/compare/v0.4.0...v0.5.0) - 2026-10-15
+
+
+### Highlights
+
+- Add opt-in Prometheus metrics on `GET /metrics`, authenticated with a dedicated `UPREST_METRICS_TOKEN`. Export HTTP latency and errors, Redis capacity and pool activity, and active SSE streams without exposing credentials or contacting Redis during scrapes.
+- Add process-wide `UPREST_ACQUIRE_TIMEOUT` and `UPREST_COMMAND_TIMEOUT`, each defaulting to `30s`, with independent capacity and execution budgets and an automatically calculated HTTP write timeout.
+- Validate complete command requests before acquiring backend capacity. Reject prohibited batches before executing any commands or updating script aliases to protect shared Redis connections.
+
+### Breaking changes
+
+- Ordinary commands, pipelines, and transactions now reject connection-changing, transaction-control, streaming, replication/session, and script-debugging commands with HTTP `400` and `{"error":"Command is not supported over HTTP"}`. This includes `AUTH`, `HELLO`, `SELECT`, `MULTI`, `EXEC`, `WATCH`, subscription commands, `MONITOR`, and `SCRIPT DEBUG`.
+- `CLIENT` now permits only `GETNAME`, `GETREDIR`, `ID`, `INFO`, `LIST`, `TRACKINGINFO`, and `HELP`. Configure Redis credentials and database selection in backend connection URLs; use `/multi-exec` for transactions and `/subscribe`, `/psubscribe`, or `/monitor` for SSE streams. See the README's shared connection isolation section for the complete policy.
+- When metrics are enabled, the exact `/metrics` path is reserved and accepts only its dedicated Bearer token. Use `POST /` for a Redis command named `metrics`; leave `UPREST_METRICS_TOKEN` unset to preserve the existing path behavior.
+
+### Features
+
+- Add authenticated Prometheus metrics - ([b82e410](https://github.com/nelsonlaidev/uprest/commit/b82e4105f1e94922524712a87a1bfc1347394fa2))
+- Add configurable acquisition and command timeouts - ([ece98cb](https://github.com/nelsonlaidev/uprest/commit/ece98cb1c328738ef29705dde5dac6069cba8a58))
+- Validate commands to protect shared Redis connections - ([14f2901](https://github.com/nelsonlaidev/uprest/commit/14f2901e6f3bdf74e4444b6dfe717af669c15f0a))
+
 ## v0.4.0
 
 [Compare v0.3.0...v0.4.0](https://github.com/nelsonlaidev/uprest/compare/v0.3.0...v0.4.0) - 2026-10-02
