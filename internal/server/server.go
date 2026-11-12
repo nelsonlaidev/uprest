@@ -742,6 +742,14 @@ func (h *apiHandler) serveBatch(w http.ResponseWriter, r *http.Request, client *
 }
 
 func (h *apiHandler) normalizeCommand(r *http.Request, command []any) []any {
+	if rewritten, changed := upstash.RewriteXAutoClaimZeroCount(command); changed {
+		command = rewritten
+		h.logger.DebugContext(r.Context(), "Upstash XAUTOCLAIM COUNT 0 translated",
+			"request_id", r.Context().Value(requestIDContextKey{}),
+			"command", "XAUTOCLAIM",
+		)
+	}
+
 	if rewritten, changed := upstash.RewriteScanWithType(command); changed {
 		command = rewritten
 		h.logger.DebugContext(r.Context(), "Upstash SCAN WITHTYPE translated",

@@ -215,6 +215,7 @@ Open an authenticated `POST /monitor` stream with the same bearer token. The fir
 
 - `@upstash/ratelimit` 2.1.0 and later works; Uprest strips the Upstash-only `allow-key-locking` Lua flag before forwarding scripts.
 - `scan` with `{ withType: true }` is supported for commands, pipelines, and transactions. The Redis user needs permission for `EVAL`, `SCAN`, and `TYPE`.
+- `xautoclaim` with `{ count: 0 }` returns `["0-0", [], []]` without claiming messages or removing deleted entries from the pending list, including with `JUSTID`. Body and path commands, pipelines, and transactions support this through a Lua adapter; the Redis user needs `EVAL`, `XAUTOCLAIM`, and `XPENDING` permissions. Invalid arguments and missing streams or groups still return errors. Other counts retain Redis's behavior.
 - Upstash Search and Vector commands and some RedisJSON response details are unsupported; see [`tests/compatibility/exclusions.txt`](tests/compatibility/exclusions.txt).
 
 ## Deployment
